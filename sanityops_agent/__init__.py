@@ -17,8 +17,7 @@ from sanityops_agent.agents import (
     SubAgentRequest,
     SubAgentResponse,
 )
-from sanityops_agent.config import AgentConfig as AppConfigAgentConfig
-from sanityops_agent.config import AppConfig, ProviderConfig, ToolConfig
+from sanityops_agent.config import AgentConfig, AppConfig, ProviderConfig, ToolConfig
 
 # Core
 from sanityops_agent.core import (
@@ -92,8 +91,7 @@ from sanityops_agent.managers import (
 )
 
 # Tools
-from sanityops_agent.tools import Tool, ToolContext, ToolRegistry
-from sanityops_agent.tools import ToolResult as ToolToolResult
+from sanityops_agent.tools import Tool, ToolContext, ToolRegistry, ToolResult
 
 # Tools - Builtins
 from sanityops_agent.tools.builtins import BashTool, FileOpsTool
@@ -103,7 +101,7 @@ __all__ = [
     "__version__",
     # Config
     "AppConfig",
-    "AppConfigAgentConfig",  # config.AgentConfig (distinct from core.AgentConfig)
+    "AgentConfig",
     "ProviderConfig",
     "ToolConfig",
     # Core Agent
@@ -150,7 +148,7 @@ __all__ = [
     "AnthropicAdapter",
     # Tools
     "Tool",
-    "ToolToolResult",  # tools.ToolResult
+    "ToolResult",
     "ToolContext",
     "ToolRegistry",
     # Tools - Builtins

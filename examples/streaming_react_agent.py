@@ -4,7 +4,7 @@ real-time logging of thought process, tool calls, and observations.
 
 Usage:
     cp .env.example .env   # fill in your API key and base_url
-    uv run python examples/streaming_react_sanityops_agent.py "What's 25 * 13?"
+    uv run python examples/streaming_react_agent.py "What's 25 * 13?"
 """
 
 from __future__ import annotations

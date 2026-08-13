@@ -11,7 +11,7 @@ from sanityops_agent.llm.base import LLMProvider
 from sanityops_agent.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from managers.skill import SkillManager
+    from sanityops_agent.managers.skill import SkillManager
 
 
 class AgentFactory:
