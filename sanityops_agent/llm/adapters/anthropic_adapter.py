@@ -221,7 +221,6 @@ class AnthropicAdapter(MessageAdapter):
     def map_exception(exception: Exception) -> Exception:
         """Map provider-specific exceptions to internal LLMError types."""
         exc_type_name = type(exception).__name__
-        f"{type(exception).__module__}.{exc_type_name}"
         msg = str(exception).lower()
 
         if exc_type_name in ("AuthenticationError",):

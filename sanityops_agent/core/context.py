@@ -80,7 +80,6 @@ class AgentContext:
         # 2. Determine which to compact (oldest ones) and which to preserve (recent ones)
         num_to_compact = total_tool_results - preserve_count
         to_compact = all_tool_results[:num_to_compact]
-        all_tool_results[num_to_compact:]
 
         # 3. Replace compacted tool results with summary text blocks
         for msg, idx, block in to_compact:
