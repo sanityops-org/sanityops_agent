@@ -45,6 +45,10 @@ class OpenAIProvider(LLMProvider):
 
     Uses the official OpenAI SDK. Compatible with any server that
     implements the OpenAI chat completions API.
+
+    Not thread-safe and not safe for concurrent asyncio access: the client
+    is created lazily and closed by the agent that owns it.  Intended for
+    sequential use within a single event loop.
     """
 
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -64,7 +68,9 @@ class OpenAIProvider(LLMProvider):
         self.adapter = OpenAIAdapter()
 
     def _get_client(self) -> AsyncOpenAI:
-        if self._client is None or self._client.is_closed:
+        # A closed client is replaced with a fresh one; it is already closed
+        # so needs no cleanup here (single-context use, see class docstring).
+        if self._client is None or self._client.is_closed():
             self._client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url or self.DEFAULT_BASE_URL,
@@ -74,8 +80,16 @@ class OpenAIProvider(LLMProvider):
         return self._client
 
     async def close(self):
-        if self._client and not self._client.is_closed:
-            await self._client.close()
+        # Best-effort and idempotent: never raise and never keep a stale
+        # reference, even if the client was already closed or its
+        # close()/is_closed() raised.  This is cleanup (typically from a
+        # finally block), so a failing client close must not propagate.
+        try:
+            if self._client is not None and not self._client.is_closed():
+                await self._client.close()
+        except Exception as e:
+            logger.warning("Failed to close LLM client: %s", e, exc_info=True)
+        finally:
             self._client = None
 
     async def create(
