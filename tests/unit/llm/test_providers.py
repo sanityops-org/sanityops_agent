@@ -319,8 +319,9 @@ class TestOpenAIProviderStream:
 # a method-style fake matching the real SDK clients.
 
 class _MethodStyleSdkClient:
-    """Fake SDK client whose ``is_closed`` is a *method* (like the real
-    AsyncOpenAI / AsyncAnthropic clients), not a plain attribute."""
+    """Fake SDK client whose ``is_closed`` is a method (like the real
+    AsyncOpenAI / AsyncAnthropic clients), not a plain attribute.
+    """
 
     def __init__(self, **kwargs):
         self._closed = False
@@ -368,7 +369,8 @@ PROVIDER_CLASSES = [OpenAIProvider, AnthropicProvider]
 
 def _patch_sdk_class(provider_cls, monkeypatch, fake_cls):
     """Point the provider module's SDK class at a fake so ``_get_client()``
-    never instantiates a real (network-lazy) SDK client in these unit tests."""
+    never instantiates a real (network-lazy) SDK client in these unit tests.
+    """
     module = importlib.import_module(provider_cls.__module__)
     sdk_name = "AsyncOpenAI" if provider_cls == OpenAIProvider else "AsyncAnthropic"
     monkeypatch.setattr(module, sdk_name, fake_cls)
