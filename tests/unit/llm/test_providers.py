@@ -338,6 +338,22 @@ class _MethodStyleSdkClient:
         self._closed = True
 
 
+class _RaisingCloseClient:
+    """Fake SDK client whose ``close()`` raises — like a broken transport.
+
+    ``provider.close()`` is best-effort and must not propagate the error.
+    """
+
+    def __init__(self):
+        self._closed = False
+
+    def is_closed(self):
+        return self._closed
+
+    async def close(self):
+        raise RuntimeError("transport failed to close")
+
+
 PROVIDER_CLASSES = [OpenAIProvider, AnthropicProvider]
 
 
@@ -360,6 +376,20 @@ async def test_close_closes_method_style_client(provider_cls):
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
 @pytest.mark.asyncio
+async def test_close_is_best_effort_when_client_close_raises(provider_cls):
+    """provider.close() must not raise when the SDK client's close() fails.
+
+    close() is best-effort: an error from the underlying client must not
+    propagate to the caller, and the provider must still drop its reference.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingCloseClient()
+    await provider.close()  # must not raise
+    assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
 async def test_get_client_reuses_open_client(provider_cls):
     """_get_client() must reuse the existing client, not leak a new one per call.
 
@@ -368,8 +398,8 @@ async def test_get_client_reuses_open_client(provider_cls):
     method is truthy), so every call created a fresh SDK client.
     """
     provider = provider_cls(api_key="sk-test")
-    first = provider._get_client()
     try:
+        first = provider._get_client()
         second = provider._get_client()
         assert first is second, "_get_client() must reuse the existing client"
     finally:
@@ -381,11 +411,11 @@ async def test_get_client_reuses_open_client(provider_cls):
 async def test_get_client_creates_fresh_after_close(provider_cls):
     """After close(), _get_client() must create a fresh client."""
     provider = provider_cls(api_key="sk-test")
-    first = provider._get_client()
-    await provider.close()
-    assert provider._client is None
-    second = provider._get_client()
     try:
+        first = provider._get_client()
+        await provider.close()
+        assert provider._client is None
+        second = provider._get_client()
         assert second is not first
     finally:
         await provider.close()
