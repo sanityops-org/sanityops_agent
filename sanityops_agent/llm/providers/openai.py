@@ -68,6 +68,8 @@ class OpenAIProvider(LLMProvider):
         self.adapter = OpenAIAdapter()
 
     def _get_client(self) -> AsyncOpenAI:
+        # A closed client is replaced with a fresh one; it is already closed
+        # so needs no cleanup here (single-context use, see class docstring).
         if self._client is None or self._client.is_closed():
             self._client = AsyncOpenAI(
                 api_key=self.api_key,
