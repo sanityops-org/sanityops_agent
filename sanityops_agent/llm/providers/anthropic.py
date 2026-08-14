@@ -70,6 +70,9 @@ class AnthropicProvider(LLMProvider):
         self.adapter = AnthropicAdapter()
 
     def _get_client(self) -> AsyncAnthropic:
+        # Replace a closed client with a fresh one; a closed client is already
+        # cleaned up (that is what is_closed() == True means), so no explicit
+        # close here — single-context use, see the class docstring.
         if self._client is None or self._client.is_closed():
             self._client = AsyncAnthropic(
                 api_key=self.api_key,
