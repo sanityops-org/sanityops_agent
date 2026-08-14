@@ -66,7 +66,7 @@ class AnthropicProvider(LLMProvider):
         self.adapter = AnthropicAdapter()
 
     def _get_client(self) -> AsyncAnthropic:
-        if self._client is None or self._client.is_closed:
+        if self._client is None or self._client.is_closed():
             self._client = AsyncAnthropic(
                 api_key=self.api_key,
                 base_url=self.base_url or self.DEFAULT_BASE_URL,
@@ -76,9 +76,9 @@ class AnthropicProvider(LLMProvider):
         return self._client
 
     async def close(self):
-        if self._client and not self._client.is_closed:
+        if self._client is not None and not self._client.is_closed():
             await self._client.close()
-            self._client = None
+        self._client = None
 
     async def create(
         self,
