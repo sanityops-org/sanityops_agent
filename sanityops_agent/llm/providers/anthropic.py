@@ -76,9 +76,17 @@ class AnthropicProvider(LLMProvider):
         return self._client
 
     async def close(self):
-        if self._client is not None and not self._client.is_closed():
-            await self._client.close()
-        self._client = None
+        # Best-effort and idempotent: never raise and never keep a stale
+        # reference, even if the client was already closed or its
+        # close()/is_closed() raised.  This is cleanup, so a failing client
+        # close must not propagate to the caller (e.g. a finally block).
+        try:
+            if self._client is not None and not self._client.is_closed():
+                await self._client.close()
+        except Exception:
+            pass
+        finally:
+            self._client = None
 
     async def create(
         self,
