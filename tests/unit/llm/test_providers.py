@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -328,7 +329,7 @@ class _MethodStyleSdkClient:
     """Fake SDK client whose ``is_closed`` is a *method* (like the real
     AsyncOpenAI / AsyncAnthropic clients), not a plain attribute."""
 
-    def __init__(self):
+    def __init__(self, **kwargs):
         self._closed = False
 
     def is_closed(self):
@@ -355,6 +356,14 @@ class _RaisingCloseClient:
 
 
 PROVIDER_CLASSES = [OpenAIProvider, AnthropicProvider]
+
+
+def _patch_sdk_class(provider_cls, monkeypatch, fake_cls):
+    """Point the provider module's SDK class at a fake so ``_get_client()``
+    never instantiates a real (network-lazy) SDK client in these unit tests."""
+    module = importlib.import_module(provider_cls.__module__)
+    sdk_name = "AsyncOpenAI" if provider_cls is OpenAIProvider else "AsyncAnthropic"
+    monkeypatch.setattr(module, sdk_name, fake_cls)
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
@@ -390,7 +399,7 @@ async def test_close_is_best_effort_when_client_close_raises(provider_cls):
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
 @pytest.mark.asyncio
-async def test_get_client_reuses_open_client(provider_cls):
+async def test_get_client_reuses_open_client(provider_cls, monkeypatch):
     """_get_client() must reuse the existing client, not leak a new one per call.
 
     Regression: before the fix the guard ``self._client is None or
@@ -398,6 +407,7 @@ async def test_get_client_reuses_open_client(provider_cls):
     method is truthy), so every call created a fresh SDK client.
     """
     provider = provider_cls(api_key="sk-test")
+    _patch_sdk_class(provider_cls, monkeypatch, _MethodStyleSdkClient)
     try:
         first = provider._get_client()
         second = provider._get_client()
@@ -408,9 +418,10 @@ async def test_get_client_reuses_open_client(provider_cls):
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
 @pytest.mark.asyncio
-async def test_get_client_creates_fresh_after_close(provider_cls):
+async def test_get_client_creates_fresh_after_close(provider_cls, monkeypatch):
     """After close(), _get_client() must create a fresh client."""
     provider = provider_cls(api_key="sk-test")
+    _patch_sdk_class(provider_cls, monkeypatch, _MethodStyleSdkClient)
     try:
         first = provider._get_client()
         await provider.close()

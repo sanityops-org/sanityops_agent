@@ -82,7 +82,7 @@ class OpenAIProvider(LLMProvider):
             if self._client is not None and not self._client.is_closed():
                 await self._client.close()
         except Exception:
-            pass
+            logger.debug("Failed to close LLM client", exc_info=True)
         finally:
             self._client = None
 
