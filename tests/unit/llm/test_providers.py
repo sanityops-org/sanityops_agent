@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -304,6 +305,176 @@ class TestOpenAIProviderStream:
         assert len(chunks) == 2
         assert chunks[0].delta == "Hel"
         assert chunks[1].delta == "lo"
+
+
+# ---------------------------------------------------------------------------
+# Client lifecycle regression tests
+# ---------------------------------------------------------------------------
+# The openai/anthropic SDKs expose ``is_closed`` as a *method*, not an
+# attribute.  A bound method is always truthy, so reading it as an attribute
+# leaked a fresh client per ``_get_client()`` call and made ``close()`` a
+# silent no-op (surfacing later as "Task exception was never retrieved /
+# RuntimeError: Event loop is closed").  The mocks used elsewhere in this file
+# set ``is_closed`` as a plain attribute, which hides this bug; these tests use
+# a method-style fake matching the real SDK clients.
+
+class _MethodStyleSdkClient:
+    """Fake SDK client whose ``is_closed`` is a method (like the real
+    AsyncOpenAI / AsyncAnthropic clients), not a plain attribute.
+    """
+
+    def __init__(self, **kwargs):
+        self._closed = False
+
+    def is_closed(self):
+        return self._closed
+
+    async def close(self):
+        self._closed = True
+
+
+class _RaisingCloseClient:
+    """Fake SDK client whose ``close()`` raises — like a broken transport.
+
+    ``provider.close()`` is best-effort and must not propagate the error.
+    """
+
+    def __init__(self):
+        self._closed = False
+
+    def is_closed(self):
+        return self._closed
+
+    async def close(self):
+        raise RuntimeError("transport failed to close")
+
+
+class _RaisingIsClosedClient:
+    """Fake SDK client whose ``is_closed()`` raises.
+
+    ``_get_client()`` intentionally lets this propagate: an unexpected error
+    while inspecting the existing client must not be papered over by silently
+    constructing a fresh one.
+    """
+
+    def __init__(self):
+        # Present for interface parity with the other fakes; is_closed() always
+        # raises, so this is never read.
+        self._closed = False
+
+    def is_closed(self):
+        raise RuntimeError("is_closed failed")
+
+    async def close(self):
+        pass
+
+
+PROVIDER_CLASSES = [OpenAIProvider, AnthropicProvider]
+
+
+def _patch_sdk_class(provider_cls, monkeypatch, fake_cls):
+    """Point the provider module's SDK class at a fake so ``_get_client()``
+    never instantiates a real (network-lazy) SDK client in these unit tests.
+    """
+    module = importlib.import_module(provider_cls.__module__)
+    sdk_name = "AsyncOpenAI" if provider_cls == OpenAIProvider else "AsyncAnthropic"
+    monkeypatch.setattr(module, sdk_name, fake_cls)
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_close_closes_method_style_client(provider_cls):
+    """close() must actually close the SDK client and drop the reference.
+
+    Regression: before the fix the guard ``self._client and not
+    self._client.is_closed`` evaluated the bound method (truthy) so ``not
+    truthy`` was False and close() never ran.
+    """
+    provider = provider_cls(api_key="sk-test")
+    # The fake is injected directly, not obtained via _get_client(), so no
+    # SDK class patch is needed: the test exercises close() in isolation.
+    client = _MethodStyleSdkClient()
+    provider._client = client
+    await provider.close()
+    assert client._closed is True, "provider.close() must close the SDK client"
+    assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_close_is_best_effort_when_client_close_raises(provider_cls):
+    """provider.close() must not raise when the SDK client's close() fails.
+
+    close() is best-effort: an error from the underlying client must not
+    propagate to the caller, and the provider must still drop its reference.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingCloseClient()
+    await provider.close()  # must not raise
+    assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_close_is_best_effort_when_is_closed_raises(provider_cls):
+    """provider.close() must not raise when the client's is_closed() fails.
+
+    is_closed() is evaluated inside the try block, so an error there is
+    swallowed too and the reference is still cleared by the finally.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingIsClosedClient()
+    await provider.close()  # must not raise
+    assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+def test_get_client_propagates_is_closed_error(provider_cls):
+    """_get_client() must propagate an is_closed() error, not hide it.
+
+    An unexpected failure while inspecting the existing client is surfaced to
+    the caller rather than silently replaced with a fresh client.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingIsClosedClient()
+    with pytest.raises(RuntimeError, match="is_closed failed"):
+        provider._get_client()
+    assert isinstance(provider._client, _RaisingIsClosedClient)
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_get_client_reuses_open_client(provider_cls, monkeypatch):
+    """_get_client() must reuse the existing client, not leak a new one per call.
+
+    Regression: before the fix the guard ``self._client is None or
+    self._client.is_closed`` was always true for an existing client (bound
+    method is truthy), so every call created a fresh SDK client.
+    """
+    provider = provider_cls(api_key="sk-test")
+    _patch_sdk_class(provider_cls, monkeypatch, _MethodStyleSdkClient)
+    try:
+        first = provider._get_client()
+        second = provider._get_client()
+        assert first is second, "_get_client() must reuse the existing client"
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_get_client_creates_fresh_after_close(provider_cls, monkeypatch):
+    """After close(), _get_client() must create a fresh client."""
+    provider = provider_cls(api_key="sk-test")
+    _patch_sdk_class(provider_cls, monkeypatch, _MethodStyleSdkClient)
+    try:
+        first = provider._get_client()
+        await provider.close()
+        assert provider._client is None
+        second = provider._get_client()
+        assert second is not first
+    finally:
+        await provider.close()
 
 
 # ---------------------------------------------------------------------------

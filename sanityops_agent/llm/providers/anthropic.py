@@ -45,6 +45,10 @@ class AnthropicProvider(LLMProvider):
 
     Uses the official Anthropic SDK Messages API.
     Supports: text, thinking, tool_use content blocks.
+
+    Not thread-safe and not safe for concurrent asyncio access: the client
+    is created lazily and closed by the agent that owns it.  Intended for
+    sequential use within a single event loop.
     """
 
     DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -66,7 +70,10 @@ class AnthropicProvider(LLMProvider):
         self.adapter = AnthropicAdapter()
 
     def _get_client(self) -> AsyncAnthropic:
-        if self._client is None or self._client.is_closed:
+        # Replace a closed client with a fresh one; a closed client is already
+        # cleaned up (that is what is_closed() == True means), so no explicit
+        # close here — single-context use, see the class docstring.
+        if self._client is None or self._client.is_closed():
             self._client = AsyncAnthropic(
                 api_key=self.api_key,
                 base_url=self.base_url or self.DEFAULT_BASE_URL,
@@ -76,8 +83,16 @@ class AnthropicProvider(LLMProvider):
         return self._client
 
     async def close(self):
-        if self._client and not self._client.is_closed:
-            await self._client.close()
+        # Best-effort and idempotent: never raise and never keep a stale
+        # reference, even if the client was already closed or its
+        # close()/is_closed() raised.  This is cleanup, so a failing client
+        # close must not propagate to the caller (e.g. a finally block).
+        try:
+            if self._client is not None and not self._client.is_closed():
+                await self._client.close()
+        except Exception as e:
+            logger.warning("Failed to close LLM client: %s", e, exc_info=True)
+        finally:
             self._client = None
 
     async def create(
