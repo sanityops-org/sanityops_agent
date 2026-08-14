@@ -348,6 +348,21 @@ class _RaisingCloseClient:
         raise RuntimeError("transport failed to close")
 
 
+class _RaisingIsClosedClient:
+    """Fake SDK client whose ``is_closed()`` raises.
+
+    ``_get_client()`` intentionally lets this propagate: an unexpected error
+    while inspecting the existing client must not be papered over by silently
+    constructing a fresh one.
+    """
+
+    def is_closed(self):
+        raise RuntimeError("is_closed failed")
+
+    async def close(self):
+        pass
+
+
 PROVIDER_CLASSES = [OpenAIProvider, AnthropicProvider]
 
 
@@ -388,6 +403,21 @@ async def test_close_is_best_effort_when_client_close_raises(provider_cls):
     provider._client = _RaisingCloseClient()
     await provider.close()  # must not raise
     assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
+async def test_get_client_propagates_is_closed_error(provider_cls):
+    """_get_client() must propagate an is_closed() error, not hide it.
+
+    An unexpected failure while inspecting the existing client is surfaced to
+    the caller rather than silently replaced with a fresh client.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingIsClosedClient()
+    with pytest.raises(RuntimeError, match="is_closed failed"):
+        provider._get_client()
+    assert isinstance(provider._client, _RaisingIsClosedClient)
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])

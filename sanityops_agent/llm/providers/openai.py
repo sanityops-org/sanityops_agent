@@ -45,6 +45,10 @@ class OpenAIProvider(LLMProvider):
 
     Uses the official OpenAI SDK. Compatible with any server that
     implements the OpenAI chat completions API.
+
+    Not thread-safe and not safe for concurrent asyncio access: the client
+    is created lazily and closed by the agent that owns it.  Intended for
+    sequential use within a single event loop.
     """
 
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
