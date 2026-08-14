@@ -90,8 +90,8 @@ class AnthropicProvider(LLMProvider):
         try:
             if self._client is not None and not self._client.is_closed():
                 await self._client.close()
-        except Exception:
-            logger.warning("Failed to close LLM client", exc_info=True)
+        except Exception as e:
+            logger.warning("Failed to close LLM client: %s", e, exc_info=True)
         finally:
             self._client = None
 
