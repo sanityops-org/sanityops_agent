@@ -362,7 +362,7 @@ def _patch_sdk_class(provider_cls, monkeypatch, fake_cls):
     """Point the provider module's SDK class at a fake so ``_get_client()``
     never instantiates a real (network-lazy) SDK client in these unit tests."""
     module = importlib.import_module(provider_cls.__module__)
-    sdk_name = "AsyncOpenAI" if provider_cls is OpenAIProvider else "AsyncAnthropic"
+    sdk_name = "AsyncOpenAI" if provider_cls == OpenAIProvider else "AsyncAnthropic"
     monkeypatch.setattr(module, sdk_name, fake_cls)
 
 
