@@ -310,20 +310,13 @@ class TestOpenAIProviderStream:
 # ---------------------------------------------------------------------------
 # Client lifecycle regression tests
 # ---------------------------------------------------------------------------
-# The openai/anthropic SDKs expose ``is_closed`` as a *method* on their async
-# clients, not an attribute.  The providers previously read it as an attribute
-# (``self._client.is_closed`` instead of ``self._client.is_closed()``).  A bound
-# method is always truthy, which:
-#   * leaked a fresh SDK client on every ``_get_client()`` call, and
-#   * made ``close()`` a silent no-op.
-# The leaked, never-closed httpx clients then scheduled background ``aclose()``
-# tasks from ``__del__`` that could run against an already-torn-down event loop,
-# surfacing as "Task exception was never retrieved / RuntimeError: Event loop is
-# closed".
-#
-# The mocks used elsewhere in this file set ``is_closed`` as a plain attribute,
-# which hides this bug; these tests use a method-style fake matching the real
-# SDK clients.
+# The openai/anthropic SDKs expose ``is_closed`` as a *method*, not an
+# attribute.  A bound method is always truthy, so reading it as an attribute
+# leaked a fresh client per ``_get_client()`` call and made ``close()`` a
+# silent no-op (surfacing later as "Task exception was never retrieved /
+# RuntimeError: Event loop is closed").  The mocks used elsewhere in this file
+# set ``is_closed`` as a plain attribute, which hides this bug; these tests use
+# a method-style fake matching the real SDK clients.
 
 class _MethodStyleSdkClient:
     """Fake SDK client whose ``is_closed`` is a *method* (like the real
