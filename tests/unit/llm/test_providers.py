@@ -407,6 +407,20 @@ async def test_close_is_best_effort_when_client_close_raises(provider_cls):
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
 @pytest.mark.asyncio
+async def test_close_is_best_effort_when_is_closed_raises(provider_cls):
+    """provider.close() must not raise when the client's is_closed() fails.
+
+    is_closed() is evaluated inside the try block, so an error there is
+    swallowed too and the reference is still cleared by the finally.
+    """
+    provider = provider_cls(api_key="sk-test")
+    provider._client = _RaisingIsClosedClient()
+    await provider.close()  # must not raise
+    assert provider._client is None, "provider.close() must clear its reference"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
+@pytest.mark.asyncio
 async def test_get_client_propagates_is_closed_error(provider_cls):
     """_get_client() must propagate an is_closed() error, not hide it.
 
