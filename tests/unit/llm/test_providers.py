@@ -357,6 +357,11 @@ class _RaisingIsClosedClient:
     constructing a fresh one.
     """
 
+    def __init__(self):
+        # Present for interface parity with the other fakes; is_closed() always
+        # raises, so this is never read.
+        self._closed = False
+
     def is_closed(self):
         raise RuntimeError("is_closed failed")
 
