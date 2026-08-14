@@ -386,6 +386,8 @@ async def test_close_closes_method_style_client(provider_cls):
     truthy`` was False and close() never ran.
     """
     provider = provider_cls(api_key="sk-test")
+    # The fake is injected directly, not obtained via _get_client(), so no
+    # SDK class patch is needed: the test exercises close() in isolation.
     client = _MethodStyleSdkClient()
     provider._client = client
     await provider.close()
