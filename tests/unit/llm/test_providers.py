@@ -429,8 +429,7 @@ async def test_close_is_best_effort_when_is_closed_raises(provider_cls):
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
-@pytest.mark.asyncio
-async def test_get_client_propagates_is_closed_error(provider_cls):
+def test_get_client_propagates_is_closed_error(provider_cls):
     """_get_client() must propagate an is_closed() error, not hide it.
 
     An unexpected failure while inspecting the existing client is surfaced to
