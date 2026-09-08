@@ -100,7 +100,7 @@ class TestProviderFactoryCreate:
 
     def _make_config(self, provider: str = "dummy", api_key: str = "sk-test", base_url: str | None = None, model: str = "dummy-model"):
         return ProviderConfig(
-            LLM_PROVIDER=provider,
+            PROVIDER=provider,
             API_KEY=api_key,
             BASE_URL=base_url,
             MODEL_ID=model,
@@ -144,7 +144,7 @@ class TestProviderFactoryCreateCaseInsensitive:
 
     def _make_config(self, provider: str = "dummy"):
         return ProviderConfig(
-            LLM_PROVIDER=provider,
+            PROVIDER=provider,
             API_KEY="sk-test",
         )
 

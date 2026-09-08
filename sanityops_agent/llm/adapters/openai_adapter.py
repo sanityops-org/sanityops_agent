@@ -25,6 +25,7 @@ from sanityops_agent.llm.exceptions import (
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
+    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
@@ -277,11 +278,14 @@ class OpenAIAdapter(MessageAdapter):
         msg = str(exception).lower()
 
         if exc_type_name in ("AuthenticationError",):
-            err = AuthenticationError(str(exception))
+            err: LLMError = AuthenticationError(str(exception))
             err.recoverable = False
             return err
         if exc_type_name in ("RateLimitError",):
-            err = RateLimitError(str(exception))
+            err = RateLimitError(
+                str(exception),
+                retry_after=extract_retry_after(exception),
+            )
             err.recoverable = True
             return err
         if exc_type_name in ("APIError", "APIConnectionError"):
