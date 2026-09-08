@@ -13,7 +13,7 @@ class ProviderConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", extra="ignore")
 
-    LLM_PROVIDER: str = "anthropic"
+    PROVIDER: str = "anthropic"
     API_KEY: str = ""
     BASE_URL: str | None = None
     MODEL_ID: str = "claude-sonnet-4-20250514"

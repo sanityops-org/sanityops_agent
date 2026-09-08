@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -8,6 +9,10 @@ from enum import Enum
 
 from sanityops_agent.core.context import AgentContext, CompactConfig
 from sanityops_agent.core.message import FinishReason, Message, Role
+
+MAX_RETRY_DELAY = 60.0
+
+logger = logging.getLogger(__name__)
 
 
 class TerminationReason(Enum):
@@ -135,15 +140,33 @@ class BaseAgent(ABC):
         return None
 
     async def _call_llm_with_retry(self):
-        """Agent-level retry control (feedback point 6)"""
+        """Agent-level retry control with recoverable check.
+
+        Retries only recoverable errors (rate limits, network issues, 5xx).
+        Non-recoverable errors (auth, context window) fail immediately.
+        Honors Retry-After header when provided by the provider.
+        """
         for attempt in range(self.config.max_retries):
             try:
                 return await self._call_llm()
             except Exception as e:
-                self._record_error("llm_error", str(e), 0, recoverable=True)
+                recoverable = getattr(e, "recoverable", False)
+                self._record_error("llm_error", str(e), 0, recoverable=recoverable)
+                # Cannot succeed on retry — fail immediately.
+                if not recoverable:
+                    raise
                 if attempt == self.config.max_retries - 1:
                     raise
-                await asyncio.sleep(2 ** attempt)
+                delay = self._compute_retry_delay(e, attempt)
+                logger.debug("LLM retry attempt %d, sleeping %.1fs", attempt + 1, delay)
+                await asyncio.sleep(delay)
+
+    def _compute_retry_delay(self, e: Exception, attempt: int) -> float:
+        """Prefer the provider's Retry-After, capped; fall back to backoff."""
+        retry_after: int | None = getattr(e, "retry_after", None)
+        if retry_after and retry_after > 0:
+            return float(min(retry_after, MAX_RETRY_DELAY))
+        return float(min(2 ** attempt, MAX_RETRY_DELAY))
 
     def _record_error(self, error_type: str, message: str, iteration: int,
                       tool_name: str | None = None, recoverable: bool = False):

@@ -27,6 +27,22 @@ from sanityops_agent.llm.exceptions import (
     RateLimitError,
 )
 
+
+def _extract_retry_after(exc: object) -> int | None:
+    """Read Retry-After (seconds) from an SDK API error's response header."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("retry-after")
+    if retry_after is None:
+        return None
+    try:
+        seconds = int(float(retry_after))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -277,11 +293,14 @@ class OpenAIAdapter(MessageAdapter):
         msg = str(exception).lower()
 
         if exc_type_name in ("AuthenticationError",):
-            err = AuthenticationError(str(exception))
+            err: LLMError = AuthenticationError(str(exception))
             err.recoverable = False
             return err
         if exc_type_name in ("RateLimitError",):
-            err = RateLimitError(str(exception))
+            err = RateLimitError(
+                str(exception),
+                retry_after=_extract_retry_after(exception),
+            )
             err.recoverable = True
             return err
         if exc_type_name in ("APIError", "APIConnectionError"):

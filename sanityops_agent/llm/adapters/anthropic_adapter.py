@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from anthropic.types import MessageStreamEvent
+from anthropic.lib.streaming import ParsedMessageStreamEvent
+from anthropic.types import Message as AnthropicMessage
 
 from sanityops_agent.core.message import (
     ContentType,
@@ -24,6 +25,21 @@ from sanityops_agent.llm.exceptions import (
     ProviderUnavailableError,
     RateLimitError,
 )
+
+
+def _extract_retry_after(exc: object) -> int | None:
+    """Read Retry-After (seconds) from an SDK API error's response header."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("retry-after")
+    if retry_after is None:
+        return None
+    try:
+        seconds = int(float(retry_after))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 class AnthropicAdapter(MessageAdapter):
@@ -224,11 +240,14 @@ class AnthropicAdapter(MessageAdapter):
         msg = str(exception).lower()
 
         if exc_type_name in ("AuthenticationError",):
-            err = AuthenticationError(str(exception))
+            err: LLMError = AuthenticationError(str(exception))
             err.recoverable = False
             return err
         if exc_type_name in ("RateLimitError",):
-            err = RateLimitError(str(exception))
+            err = RateLimitError(
+                str(exception),
+                retry_after=_extract_retry_after(exception),
+            )
             err.recoverable = True
             return err
         if exc_type_name in ("APIError", "APIConnectionError"):
@@ -238,7 +257,7 @@ class AnthropicAdapter(MessageAdapter):
                 return ContextWindowExceededError(str(exception))
         return LLMError(str(exception))
 
-    def from_sdk_response(self, response: Message) -> LLMResponse:
+    def from_sdk_response(self, response: AnthropicMessage) -> LLMResponse:
         """Convert Anthropic SDK Message to LLMResponse."""
         content: list = []
         for block in response.content:
@@ -264,30 +283,34 @@ class AnthropicAdapter(MessageAdapter):
             raw_response=response.model_dump(),
         )
 
-    def from_sdk_stream_event(self, event: MessageStreamEvent) -> StreamChunk | None:
-        """Convert Anthropic SDK MessageStreamEvent to StreamChunk."""
+    def from_sdk_stream_event(
+        self, event: ParsedMessageStreamEvent
+    ) -> StreamChunk | None:
+        """Convert Anthropic SDK ParsedMessageStreamEvent to StreamChunk."""
         event_type = event.type
 
         if event_type == "text":
             return StreamChunk(
                 type=ContentType.TEXT,
-                delta=event.text,
+                delta=event.text,  # type: ignore[union-attr]
             )
 
         if event_type == "thinking":
             return StreamChunk(
                 type=ContentType.THINKING,
-                delta=event.thinking,
+                delta=event.thinking,  # type: ignore[union-attr]
             )
 
         if event_type == "input_json":
             return StreamChunk(
                 type=ContentType.TOOL_USE,
-                delta=event.partial_json,
+                delta=event.partial_json,  # type: ignore[union-attr]
             )
 
         if event_type == "content_block_start":
-            block = event.content_block
+            block = getattr(event, "content_block", None)
+            if block is None:
+                return None
             if block.type == "tool_use":
                 return StreamChunk(
                     type=ContentType.TOOL_USE,
@@ -301,33 +324,34 @@ class AnthropicAdapter(MessageAdapter):
             return None
 
         if event_type == "content_block_delta":
-            delta = event.delta
-            delta_type = getattr(delta, "type", "")
+            block_delta = getattr(event, "delta", None)
+            if block_delta is None:
+                return None
+            delta_type = getattr(block_delta, "type", "")
             index = getattr(event, "index", 0)
 
             if delta_type == "text_delta":
                 return StreamChunk(
                     type=ContentType.TEXT,
-                    delta=getattr(delta, "text", ""),
+                    delta=getattr(block_delta, "text", ""),
                     index=index,
                 )
             if delta_type == "thinking_delta":
                 return StreamChunk(
                     type=ContentType.THINKING,
-                    delta=getattr(delta, "thinking", ""),
+                    delta=getattr(block_delta, "thinking", ""),
                     index=index,
                 )
             if delta_type == "input_json_delta":
                 return StreamChunk(
                     type=ContentType.TOOL_USE,
-                    delta=getattr(delta, "partial_json", ""),
+                    delta=getattr(block_delta, "partial_json", ""),
                     index=index,
                 )
             return None
 
         if event_type == "message_delta":
-            delta = event.delta
-            stop_reason = getattr(delta, "stop_reason", None)
+            stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
             if stop_reason:
                 return StreamChunk(
                     type=ContentType.TEXT,

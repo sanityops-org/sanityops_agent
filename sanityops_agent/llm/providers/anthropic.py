@@ -37,6 +37,22 @@ from sanityops_agent.llm.exceptions import (
     RateLimitError,
 )
 
+
+def _extract_retry_after(exc: object) -> int | None:
+    """Read Retry-After (seconds) from an SDK API error's response header."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("retry-after")
+    if retry_after is None:
+        return None
+    try:
+        seconds = int(float(retry_after))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,7 +140,7 @@ class AnthropicProvider(LLMProvider):
         except AnthropicAuthError as e:
             raise AuthenticationError(str(e))
         except AnthropicRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=_extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:
@@ -169,7 +185,7 @@ class AnthropicProvider(LLMProvider):
         except AnthropicAuthError as e:
             raise AuthenticationError(str(e))
         except AnthropicRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=_extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:

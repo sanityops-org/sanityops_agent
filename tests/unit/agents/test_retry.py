@@ -44,8 +44,9 @@ class _TestAgent(BaseAgent):
 class TestAgentRetry:
     """Test agent-level retry control.
 
-    Note: BaseAgent._call_llm_with_retry retries ALL exceptions with
-    exponential backoff, not just recoverable ones.
+    Note: BaseAgent._call_llm_with_retry only retries recoverable errors
+    (rate limits, network issues, 5xx). Non-recoverable errors (auth,
+    context window) fail immediately without retry.
     """
 
     @pytest.mark.asyncio
@@ -78,8 +79,8 @@ class TestAgentRetry:
         assert result.termination_reason == TerminationReason.ERROR
 
     @pytest.mark.asyncio
-    async def test_auth_error_still_retried(self):
-        """BaseAgent retries all exceptions, including auth errors."""
+    async def test_auth_error_fails_immediately(self):
+        """Non-recoverable errors fail immediately without retry."""
         config = AgentConfig(max_retries=2, max_loops=5)
         agent = _TestAgent(config)
 
@@ -89,8 +90,8 @@ class TestAgentRetry:
         ])
         result = await agent.run("test prompt")
         assert result.termination_reason == TerminationReason.ERROR
-        # All retries were attempted
-        assert agent._response_index == 2
+        # Only ONE call was made — no retry for non-recoverable errors
+        assert agent._response_index == 1
 
     def test_llm_error_not_recoverable(self):
         """Base LLMError without status_code is not recoverable by default."""
