@@ -10,7 +10,7 @@ from enum import Enum
 from sanityops_agent.core.context import AgentContext, CompactConfig
 from sanityops_agent.core.message import FinishReason, Message, Role
 
-MAX_RETRY_DELAY = 60.0
+MAX_RETRY_DELAY = 60.0  # Cap on retry backoff / Retry-After (seconds)
 
 logger = logging.getLogger(__name__)
 
