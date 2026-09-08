@@ -35,6 +35,8 @@ class ProviderConfig(BaseSettings):
 
     def model_post_init(self, __context) -> None:
         # If LLM_PROVIDER was set, use it as PROVIDER (backward compatibility)
+        # Note: LLM_PROVIDER takes precedence over PROVIDER if both are set,
+        # matching the behavior of the original config before the rename.
         if self.LLM_PROVIDER is not None:
             object.__setattr__(self, "PROVIDER", self.LLM_PROVIDER)
 
