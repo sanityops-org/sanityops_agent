@@ -35,6 +35,7 @@ from sanityops_agent.llm.exceptions import (
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
+    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class AnthropicProvider(LLMProvider):
         except AnthropicAuthError as e:
             raise AuthenticationError(str(e))
         except AnthropicRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:
@@ -169,7 +170,7 @@ class AnthropicProvider(LLMProvider):
         except AnthropicAuthError as e:
             raise AuthenticationError(str(e))
         except AnthropicRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:

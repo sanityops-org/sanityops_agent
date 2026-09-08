@@ -497,7 +497,7 @@ class TestProviderFactoryIntegration:
                      base_url: str | None = None, model: str = "default-model"):
         from sanityops_agent.config import ProviderConfig
         return ProviderConfig(
-            LLM_PROVIDER=provider,
+            PROVIDER=provider,
             API_KEY=api_key,
             BASE_URL=base_url,
             MODEL_ID=model,
@@ -524,14 +524,14 @@ class TestProviderFactoryIntegration:
 
     def test_factory_anthropic_has_correct_default_base_url(self):
         from sanityops_agent.config import ProviderConfig
-        config = ProviderConfig(LLM_PROVIDER="anthropic", API_KEY="sk-ant")
+        config = ProviderConfig(PROVIDER="anthropic", API_KEY="sk-ant")
         provider = ProviderFactory.create(config)
         assert isinstance(provider, AnthropicProvider)
         assert provider.base_url is None
 
     def test_factory_openai_has_correct_default_base_url(self):
         from sanityops_agent.config import ProviderConfig
-        config = ProviderConfig(LLM_PROVIDER="openai", API_KEY="sk-oai")
+        config = ProviderConfig(PROVIDER="openai", API_KEY="sk-oai")
         provider = ProviderFactory.create(config)
         assert isinstance(provider, OpenAIProvider)
         assert provider.base_url is None

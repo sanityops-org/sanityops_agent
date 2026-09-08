@@ -19,11 +19,11 @@ class ProviderFactory:
     @classmethod
     def create(cls, config: ProviderConfig) -> LLMProvider:
         """Create provider from config"""
-        provider_name = config.LLM_PROVIDER.lower()
+        provider_name = config.PROVIDER.lower()
 
         if provider_name not in cls._registry:
             available = ", ".join(cls._registry.keys())
-            raise ValueError(f"Unknown provider '{config.LLM_PROVIDER}'. Available: {available}")
+            raise ValueError(f"Unknown provider '{config.PROVIDER}'. Available: {available}")
 
         provider_cls = cls._registry[provider_name]
         return provider_cls(

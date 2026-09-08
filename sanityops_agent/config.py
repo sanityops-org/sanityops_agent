@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,10 +14,31 @@ class ProviderConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", extra="ignore")
 
-    LLM_PROVIDER: str = "anthropic"
+    PROVIDER: str = "anthropic"
     API_KEY: str = ""
     BASE_URL: str | None = None
     MODEL_ID: str = "claude-sonnet-4-20250514"
+
+    # Backward compatibility: LLM_PROVIDER is deprecated, use PROVIDER
+    LLM_PROVIDER: str | None = None
+
+    @field_validator("LLM_PROVIDER", mode="before")
+    @classmethod
+    def _warn_deprecated_llm_provider(cls, v: str | None) -> str | None:
+        if v is not None:
+            warnings.warn(
+                "LLM_PROVIDER is deprecated, use PROVIDER instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return v
+
+    def model_post_init(self, __context) -> None:
+        # If LLM_PROVIDER was set, use it as PROVIDER (backward compatibility)
+        # Note: LLM_PROVIDER takes precedence over PROVIDER if both are set,
+        # matching the behavior of the original config before the rename.
+        if self.LLM_PROVIDER is not None:
+            object.__setattr__(self, "PROVIDER", self.LLM_PROVIDER)
 
 
 class AgentConfig(BaseSettings):

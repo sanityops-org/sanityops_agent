@@ -35,6 +35,7 @@ from sanityops_agent.llm.exceptions import (
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
+    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,7 @@ class OpenAIProvider(LLMProvider):
         except OpenAIAuthError as e:
             raise AuthenticationError(str(e))
         except OpenAIRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):
@@ -151,7 +152,7 @@ class OpenAIProvider(LLMProvider):
         except OpenAIAuthError as e:
             raise AuthenticationError(str(e))
         except OpenAIRateLimit as e:
-            raise RateLimitError(str(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):
