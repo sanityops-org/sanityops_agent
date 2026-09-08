@@ -35,22 +35,8 @@ from sanityops_agent.llm.exceptions import (
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
+    extract_retry_after,
 )
-
-
-def _extract_retry_after(exc: object) -> int | None:
-    """Read Retry-After (seconds) from an SDK API error's response header."""
-    response = getattr(exc, "response", None)
-    if response is None:
-        return None
-    retry_after = response.headers.get("retry-after")
-    if retry_after is None:
-        return None
-    try:
-        seconds = int(float(retry_after))
-    except (TypeError, ValueError):
-        return None
-    return seconds if seconds > 0 else None
 
 
 logger = logging.getLogger(__name__)
@@ -129,7 +115,7 @@ class OpenAIProvider(LLMProvider):
         except OpenAIAuthError as e:
             raise AuthenticationError(str(e))
         except OpenAIRateLimit as e:
-            raise RateLimitError(str(e), retry_after=_extract_retry_after(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):
@@ -167,7 +153,7 @@ class OpenAIProvider(LLMProvider):
         except OpenAIAuthError as e:
             raise AuthenticationError(str(e))
         except OpenAIRateLimit as e:
-            raise RateLimitError(str(e), retry_after=_extract_retry_after(e))
+            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
         except BadRequestError as e:
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):

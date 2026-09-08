@@ -1,6 +1,28 @@
 """Unified exception system for LLM errors."""
 
 
+def extract_retry_after(exc: object) -> int | None:
+    """Read Retry-After (seconds) from an SDK API error's response header.
+
+    Args:
+        exc: An SDK exception that may have a `response` attribute with headers.
+
+    Returns:
+        The Retry-After value in seconds, or None if not present/invalid.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("retry-after")
+    if retry_after is None:
+        return None
+    try:
+        seconds = int(float(retry_after))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 class LLMError(Exception):
     """Base LLM error."""
 

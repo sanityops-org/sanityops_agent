@@ -25,22 +25,8 @@ from sanityops_agent.llm.exceptions import (
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
+    extract_retry_after,
 )
-
-
-def _extract_retry_after(exc: object) -> int | None:
-    """Read Retry-After (seconds) from an SDK API error's response header."""
-    response = getattr(exc, "response", None)
-    if response is None:
-        return None
-    retry_after = response.headers.get("retry-after")
-    if retry_after is None:
-        return None
-    try:
-        seconds = int(float(retry_after))
-    except (TypeError, ValueError):
-        return None
-    return seconds if seconds > 0 else None
 
 
 logger = logging.getLogger(__name__)
@@ -299,7 +285,7 @@ class OpenAIAdapter(MessageAdapter):
         if exc_type_name in ("RateLimitError",):
             err = RateLimitError(
                 str(exception),
-                retry_after=_extract_retry_after(exception),
+                retry_after=extract_retry_after(exception),
             )
             err.recoverable = True
             return err
