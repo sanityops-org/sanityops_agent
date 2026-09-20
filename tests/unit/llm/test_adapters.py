@@ -644,3 +644,53 @@ class TestOpenAIAdapterMapException:
         mod, cls_name = full_name.rsplit(".", 1)
         exc_cls = type(cls_name, (Exception,), {})
         return exc_cls(msg)
+
+
+# ====================================================================
+# GeminiAdapter – text message conversion
+# ====================================================================
+
+
+class TestGeminiAdapterText:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_single_user_text_message(self, adapter):
+        messages = [Message.from_text(Role.USER, "Hello")]
+        result = adapter.to_provider(messages)
+
+        assert "contents" in result
+        assert len(result["contents"]) == 1
+        content = result["contents"][0]
+        assert content["role"] == "user"
+        assert len(content["parts"]) == 1
+        assert content["parts"][0]["text"] == "Hello"
+
+    def test_assistant_role_becomes_model(self, adapter):
+        messages = [Message.from_text(Role.ASSISTANT, "Hi there")]
+        result = adapter.to_provider(messages)
+
+        content = result["contents"][0]
+        assert content["role"] == "model"
+        assert content["parts"][0]["text"] == "Hi there"
+
+    def test_system_message_becomes_system_instruction(self, adapter):
+        messages = [Message.from_text(Role.SYSTEM, "You are helpful")]
+        result = adapter.to_provider(messages)
+
+        assert "systemInstruction" in result
+        assert result["systemInstruction"]["parts"][0]["text"] == "You are helpful"
+        assert result["contents"] == []
+
+    def test_system_plus_user(self, adapter):
+        messages = [
+            Message.from_text(Role.SYSTEM, "Be concise"),
+            Message.from_text(Role.USER, "What is 2+2?"),
+        ]
+        result = adapter.to_provider(messages)
+
+        assert result["systemInstruction"]["parts"][0]["text"] == "Be concise"
+        assert len(result["contents"]) == 1
+        assert result["contents"][0]["role"] == "user"
