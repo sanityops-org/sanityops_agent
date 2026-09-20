@@ -235,7 +235,6 @@ Expected: FAIL with `ModuleNotFoundError` or `ImportError`
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -899,14 +898,6 @@ from sanityops_agent.core.message import (
 )
 from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
-from sanityops_agent.llm.exceptions import (
-    APIConnectionError,
-    AuthenticationError,
-    ContextWindowExceededError,
-    LLMError,
-    ProviderUnavailableError,
-    RateLimitError,
-)
 
 logger = logging.getLogger(__name__)
 
