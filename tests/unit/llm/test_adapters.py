@@ -694,3 +694,107 @@ class TestGeminiAdapterText:
         assert result["systemInstruction"]["parts"][0]["text"] == "Be concise"
         assert len(result["contents"]) == 1
         assert result["contents"][0]["role"] == "user"
+
+
+# ====================================================================
+# GeminiAdapter – tool use blocks
+# ====================================================================
+
+
+class TestGeminiAdapterToolUse:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_tool_use_block_conversion(self, adapter):
+        tool_call = ToolUseBlock(
+            tool_call_id="call_abc",
+            tool_name="search",
+            tool_input={"query": "weather"},
+        )
+        msg = Message(role=Role.ASSISTANT, content=[tool_call])
+        result = adapter.to_provider([msg])
+
+        part = result["contents"][0]["parts"][0]
+        assert "functionCall" in part
+        assert part["functionCall"]["name"] == "search"
+        assert part["functionCall"]["args"] == {"query": "weather"}
+
+    def test_tool_result_block_conversion(self, adapter):
+        result_block = ToolResultBlock(
+            tool_call_id="call_abc",
+            tool_result_content="Sunny, 75F",
+            is_error=False,
+        )
+        msg = Message(role=Role.USER, content=[result_block])
+        out = adapter.to_provider([msg])
+
+        part = out["contents"][0]["parts"][0]
+        assert "functionResponse" in part
+        # Unpaired fallback: name falls back to the call id
+        assert part["functionResponse"]["name"] == "call_abc"
+        assert part["functionResponse"]["response"]["result"] == "Sunny, 75F"
+
+    def test_tool_result_uses_function_name_from_prior_tool_use(self, adapter):
+        """The real agent flow sends ToolUse then ToolResult. Gemini's
+        FunctionResponse requires the FUNCTION NAME, not the call id, so the
+        adapter must look it up from the earlier ToolUseBlock."""
+        tool_use = ToolUseBlock(
+            tool_call_id="call_abc",
+            tool_name="search",
+            tool_input={"query": "weather"},
+        )
+        tool_result = ToolResultBlock(
+            tool_call_id="call_abc",
+            tool_result_content="Sunny, 75F",
+        )
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_use]),
+            Message(role=Role.USER, content=[tool_result]),
+        ]
+        out = adapter.to_provider(messages)
+
+        call_part = out["contents"][0]["parts"][0]["functionCall"]
+        assert call_part["id"] == "call_abc"
+        assert call_part["name"] == "search"
+
+        resp_part = out["contents"][1]["parts"][0]["functionResponse"]
+        assert resp_part["id"] == "call_abc"
+        assert resp_part["name"] == "search"
+        assert resp_part["response"]["result"] == "Sunny, 75F"
+
+    def test_tools_parameter(self, adapter):
+        tool_def = ToolDefinition(
+            name="search",
+            description="Search the web",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+        messages = [Message.from_text(Role.USER, "Search for cats")]
+        result = adapter.to_provider(messages, tools=[tool_def])
+
+        assert "tools" in result
+        assert "functionDeclarations" in result["tools"][0]
+        assert result["tools"][0]["functionDeclarations"][0]["name"] == "search"
+
+    def test_parse_tool_use_response(self, adapter):
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": {"query": "test"},
+                        }
+                    }]
+                },
+                "finishReason": "STOP",
+            }],
+            "model": "gemini-3.5-flash-lite",
+        }
+        result = adapter.from_provider_response(response)
+
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], ToolUseBlock)
+        assert result.content[0].tool_name == "search"
+        assert result.content[0].tool_input == {"query": "test"}
