@@ -535,3 +535,92 @@ class TestProviderFactoryIntegration:
         provider = ProviderFactory.create(config)
         assert isinstance(provider, OpenAIProvider)
         assert provider.base_url is None
+
+
+# ---------------------------------------------------------------------------
+# GeminiProvider tests
+# ---------------------------------------------------------------------------
+
+class TestGeminiProviderInstantiation:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_can_be_instantiated_with_defaults(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="test-key")
+        assert provider.api_key == "test-key"
+        assert provider.model == "gemini-3.5-flash-lite"
+        assert provider.adapter is not None
+
+    def test_can_be_instantiated_with_vertex_ai_config(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(
+            api_key="test-key",
+            project_id="my-project",
+            location="us-central1",
+        )
+        assert provider.project_id == "my-project"
+        assert provider.location == "us-central1"
+
+    def test_thinking_config(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(
+            api_key="test-key",
+            thinking_budget=2048,
+            store_thinking=True,
+        )
+        assert provider.thinking_budget == 2048
+        assert provider.store_thinking is True
+
+
+class _FakeGeminiClient:
+    """Fake google-genai client: ``close()`` on the sync side, ``aclose()``
+    on the ``aio`` side — matching the real SDK's split."""
+
+    def __init__(self):
+        self.sync_closed = False
+        self.async_closed = False
+
+    def close(self):
+        self.sync_closed = True
+
+    @property
+    def aio(self):
+        return self
+
+    async def aclose(self):
+        self.async_closed = True
+
+
+class _RaisingGeminiClient(_FakeGeminiClient):
+    async def aclose(self):
+        raise RuntimeError("transport failed to close")
+
+
+class TestGeminiProviderClose:
+    @pytest.mark.asyncio
+    async def test_close_closes_async_client_and_clears_reference(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        client = _FakeGeminiClient()
+        provider._client = client
+        await provider.close()
+        assert client.async_closed is True
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_is_best_effort_when_aclose_raises(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        provider._client = _RaisingGeminiClient()
+        await provider.close()  # must not raise
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_is_noop_when_no_client(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        await provider.close()  # must not raise
+        assert provider._client is None
