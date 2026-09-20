@@ -889,3 +889,114 @@ class TestGeminiAdapterStreaming:
         result = adapter.from_provider_chunk(chunk)
 
         assert result.finish_reason == FinishReason.MAX_TOKENS
+
+
+# ====================================================================
+# GeminiAdapter – map_exception
+# ====================================================================
+
+
+class TestGeminiAdapterMapException:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_authentication_error_401(self, adapter):
+        """401 status code should map to AuthenticationError with recoverable=False."""
+        exc = self._fake_api_error(401, "Unauthorized")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, AuthenticationError)
+        assert mapped.recoverable is False
+
+    def test_authentication_error_403(self, adapter):
+        """403 status code should map to AuthenticationError with recoverable=False."""
+        exc = self._fake_api_error(403, "Permission denied")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, AuthenticationError)
+        assert mapped.recoverable is False
+
+    def test_rate_limit_error(self, adapter):
+        """429 status code should map to RateLimitError with retry_after."""
+        exc = self._fake_api_error(429, "Rate limited", headers={"retry-after": "60"})
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, RateLimitError)
+        assert mapped.recoverable is True
+        # retry_after should be extracted from headers
+
+    def test_api_error_500(self, adapter):
+        """500+ status codes should map to ProviderUnavailableError."""
+        exc = self._fake_api_error(500, "Internal server error")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_api_error_503(self, adapter):
+        """503 status code should map to ProviderUnavailableError."""
+        exc = self._fake_api_error(503, "Service unavailable")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_context_window_exceeded_error(self, adapter):
+        """400 status with 'context' in message should map to ContextWindowExceededError."""
+        exc = self._fake_api_error(400, "Request payload size exceeds the limit: context window exceeded")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_context_window_exceeded_error_token_keyword(self, adapter):
+        """400 status with 'token' in message should map to ContextWindowExceededError."""
+        exc = self._fake_api_error(400, "Token count exceeds the maximum limit")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_llm_error_400_no_context(self, adapter):
+        """400 status without context keywords should map to LLMError."""
+        exc = self._fake_api_error(400, "Invalid request format")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, LLMError)
+        assert not isinstance(mapped, ContextWindowExceededError)
+
+    def test_unknown_sdk_exception_by_name_resource_exhausted(self, adapter):
+        """ResourceExhausted by name should map to RateLimitError."""
+        exc = self._fake_exception("ResourceExhausted", "Resource exhausted")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, RateLimitError)
+        assert mapped.recoverable is True
+
+    def test_unknown_sdk_exception_by_name_service_unavailable(self, adapter):
+        """ServiceUnavailable by name should map to ProviderUnavailableError."""
+        exc = self._fake_exception("ServiceUnavailable", "Service unavailable")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_plain_unrelated_exception(self, adapter):
+        """Plain unrelated exception should map to LLMError."""
+        exc = ValueError("Something went wrong")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, LLMError)
+
+    @staticmethod
+    def _fake_api_error(code: int, msg: str, headers: dict | None = None) -> Exception:
+        """Create a fake google.genai.errors.APIError-like exception."""
+        # Import the actual errors module to use the real APIError class
+        import httpx
+        from google.genai import errors as genai_errors
+
+        # Create a mock httpx.Response with the given headers
+        mock_response = httpx.Response(
+            status_code=code,
+            headers=headers or {},
+            text=msg,
+        )
+
+        # Create the actual APIError with proper arguments
+        return genai_errors.APIError(
+            code=code,
+            response_json={"error": {"message": msg}},
+            response=mock_response,
+        )
+
+    @staticmethod
+    def _fake_exception(cls_name: str, msg: str) -> Exception:
+        """Create a generic exception with the given class name."""
+        exc_cls = type(cls_name, (Exception,), {})
+        return exc_cls(msg)
