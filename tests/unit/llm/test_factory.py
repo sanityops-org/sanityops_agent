@@ -184,3 +184,48 @@ class TestProviderFactoryListProviders:
     def test_list_providers_empty_when_nothing_registered(self):
         """list_providers() returns an empty list when no providers are registered."""
         assert ProviderFactory.list_providers() == []
+
+
+class TestProviderFactoryGemini:
+    @pytest.fixture(autouse=True)
+    def _setup_registry(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        ProviderFactory.register("gemini", GeminiProvider)
+        yield
+        ProviderFactory._registry.pop("gemini", None)
+
+    def _make_config(self, **kwargs):
+        from sanityops_agent.config import ProviderConfig
+        defaults = {"PROVIDER": "gemini", "API_KEY": "test-key"}
+        defaults.update(kwargs)
+        return ProviderConfig(**defaults)
+
+    def test_factory_creates_gemini_provider(self):
+        config = self._make_config(MODEL_ID="gemini-3.5-flash-lite")
+        provider = ProviderFactory.create(config)
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        assert isinstance(provider, GeminiProvider)
+        assert provider.api_key == "test-key"
+        assert provider.model == "gemini-3.5-flash-lite"
+
+    def test_factory_gemini_with_vertex_ai(self):
+        config = self._make_config(
+            GEMINI_PROJECT_ID="my-project",
+            GEMINI_LOCATION="us-central1",
+        )
+        provider = ProviderFactory.create(config)
+        assert provider.project_id == "my-project"
+        assert provider.location == "us-central1"
+
+    def test_factory_gemini_with_thinking(self):
+        config = self._make_config(
+            GEMINI_THINKING_BUDGET=2048,
+            GEMINI_STORE_THINKING=True,
+        )
+        provider = ProviderFactory.create(config)
+        assert provider.thinking_budget == 2048
+        assert provider.store_thinking is True
+
+    def test_factory_lists_gemini_provider(self):
+        providers = ProviderFactory.list_providers()
+        assert "gemini" in providers
