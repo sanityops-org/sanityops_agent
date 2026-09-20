@@ -139,8 +139,24 @@ class GeminiProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         **kwargs,
     ) -> LLMResponse:
-        """Non-streaming call. Implemented in Task 7."""
-        raise NotImplementedError("create() implemented in Task 7")
+        """Non-streaming call to Gemini API."""
+        client = self._get_client()
+        payload = self.adapter.to_provider(messages, tools)
+        config = self._build_config(payload, kwargs)
+
+        contents = [types.Content.model_validate(c) for c in payload["contents"]]
+
+        try:
+            response = await client.aio.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+            raw = response.model_dump(by_alias=True, exclude_none=True)
+            return self.adapter.from_provider_response(raw)
+
+        except Exception as e:
+            raise self.adapter.map_exception(e)
 
     async def stream(
         self,
@@ -148,5 +164,27 @@ class GeminiProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
-        """Streaming call. Implemented in Task 7."""
-        raise NotImplementedError("stream() implemented in Task 7")
+        """Streaming call to Gemini API."""
+        client = self._get_client()
+        payload = self.adapter.to_provider(messages, tools)
+        config = self._build_config(payload, kwargs)
+
+        contents = [types.Content.model_validate(c) for c in payload["contents"]]
+
+        try:
+            # generate_content_stream is a coroutine that returns an async
+            # iterator, so it must be awaited before iteration.
+            stream = await client.aio.models.generate_content_stream(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+
+            async for chunk in stream:
+                raw = chunk.model_dump(by_alias=True, exclude_none=True)
+                result = self.adapter.from_provider_chunk(raw)
+                if result:
+                    yield result
+
+        except Exception as e:
+            raise self.adapter.map_exception(e)

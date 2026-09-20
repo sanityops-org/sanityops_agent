@@ -624,3 +624,106 @@ class TestGeminiProviderClose:
         provider = GeminiProvider(api_key="k")
         await provider.close()  # must not raise
         assert provider._client is None
+
+
+class TestGeminiProviderCreate:
+    @pytest.fixture
+    def provider(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        return GeminiProvider(api_key="test-key")
+
+    @pytest.mark.asyncio
+    async def test_create_returns_llm_response(self, provider):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sanityops_agent.core.message import Role, TextBlock
+
+        # Mock the SDK response with a real dict from model_dump(by_alias=True)
+        mock_response = MagicMock()
+        mock_response.model_dump.return_value = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello, world!"}]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-3.5-flash-lite",
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+        }
+
+        # generate_content is awaited, so it must be an AsyncMock
+        mock_models = MagicMock()
+        mock_models.generate_content = AsyncMock(return_value=mock_response)
+
+        mock_client = MagicMock()
+        mock_client.aio.models = mock_models
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            result = await provider.create(messages)
+
+        assert isinstance(result, LLMResponse)
+        assert result.model == "gemini-3.5-flash-lite"
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+
+
+class TestGeminiProviderStream:
+    @pytest.fixture
+    def provider(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        return GeminiProvider(api_key="test-key")
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_chunks(self, provider):
+        from unittest.mock import MagicMock, patch
+
+        from sanityops_agent.core.message import Role, TextBlock
+
+        # Mock streaming response chunks
+        class MockChunk:
+            def __init__(self, text):
+                self._text = text
+
+            def model_dump(self, **kwargs):
+                return {
+                    "candidates": [{
+                        "content": {"parts": [{"text": self._text}]}
+                    }]
+                }
+
+        chunks = [MockChunk("Hel"), MockChunk("lo")]
+
+        class MockAsyncStream:
+            def __init__(self, items):
+                self._items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        # generate_content_stream is a coroutine that RETURNS an async iterator,
+        # so the mock must be an async function returning MockAsyncStream.
+        async def fake_stream(**kwargs):
+            return MockAsyncStream(chunks)
+
+        mock_models = MagicMock()
+        mock_models.generate_content_stream = fake_stream
+
+        mock_client = MagicMock()
+        mock_client.aio.models = mock_models
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            results = []
+            async for chunk in provider.stream(messages):
+                results.append(chunk)
+
+        assert len(results) == 2
+        assert results[0].delta == "Hel"
+        assert results[1].delta == "lo"
