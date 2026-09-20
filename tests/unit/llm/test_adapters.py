@@ -798,3 +798,94 @@ class TestGeminiAdapterToolUse:
         assert isinstance(result.content[0], ToolUseBlock)
         assert result.content[0].tool_name == "search"
         assert result.content[0].tool_input == {"query": "test"}
+
+
+# ====================================================================
+# GeminiAdapter – from_provider_chunk (streaming)
+# ====================================================================
+
+
+class TestGeminiAdapterStreaming:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter(store_thinking=True)
+
+    def test_text_delta(self, adapter):
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello"}]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.TEXT
+        assert result.delta == "Hello"
+
+    def test_thinking_delta(self, adapter):
+        # Real Gemini thought parts carry BOTH text and thought=True
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Let me think...", "thought": True}]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.THINKING
+        assert result.delta == "Let me think..."
+
+    def test_thinking_not_stored(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        adapter = GeminiAdapter(store_thinking=False)
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "Hmm...", "thought": True},
+                        {"text": "The answer is 42"},
+                    ]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-3.5-flash-lite",
+        }
+        result = adapter.from_provider_response(response)
+
+        # Only text, no thinking block
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+        assert result.content[0].text == "The answer is 42"
+
+    def test_tool_call_delta(self, adapter):
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": {"query": "test"},
+                        }
+                    }]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.TOOL_USE
+        assert result.tool_call_id == "search"
+        assert result.delta["name"] == "search"
+
+    def test_finish_reason(self, adapter):
+        chunk = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": []}
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.finish_reason == FinishReason.MAX_TOKENS
