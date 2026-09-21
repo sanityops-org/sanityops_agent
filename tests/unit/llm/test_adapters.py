@@ -1299,3 +1299,16 @@ class TestGeminiAdapterToolResultMerging:
         assert len(result["contents"]) == 2
         assert result["contents"][1]["role"] == "user"
         assert len(result["contents"][1]["parts"]) == 1
+
+    def test_tool_result_in_non_user_role_raises(self, adapter):
+        """ToolResultBlock in non-user role should raise ValueError."""
+        tool_result = ToolResultBlock(
+            tool_call_id="call_1",
+            tool_result_content="Result",
+        )
+        # ToolResultBlock in ASSISTANT role is invalid for Gemini
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_result]),
+        ]
+        with pytest.raises(ValueError, match="ToolResultBlock must be in a user-role message"):
+            adapter.to_provider(messages)

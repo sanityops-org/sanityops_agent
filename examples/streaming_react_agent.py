@@ -127,7 +127,9 @@ class LoggingHook(Hook):
                     print(f"{C.DIM}{text[:MAX_THINKING_DISPLAY]}{'...' if len(text) > MAX_THINKING_DISPLAY else ''}{C.RESET}")
                     # Show signature if present
                     if block.thinking_signature:
-                        print(f"{C.DIM}  [signature: {block.thinking_signature[:MAX_SIGNATURE_DISPLAY]}...]{C.RESET}")
+                        sig = block.thinking_signature[:MAX_SIGNATURE_DISPLAY]
+                        ellipsis = "..." if len(block.thinking_signature) > MAX_SIGNATURE_DISPLAY else ""
+                        print(f"{C.DIM}  [signature: {sig}{ellipsis}]{C.RESET}")
 
             # Print text blocks
             for block in response.content:
@@ -136,7 +138,9 @@ class LoggingHook(Hook):
                     print(block.text)
                     # Show signature if present
                     if block.text_signature:
-                        print(f"{C.DIM}  [signature: {block.text_signature[:MAX_SIGNATURE_DISPLAY]}...]{C.RESET}")
+                        sig = block.text_signature[:MAX_SIGNATURE_DISPLAY]
+                        ellipsis = "..." if len(block.text_signature) > MAX_SIGNATURE_DISPLAY else ""
+                        print(f"{C.DIM}  [signature: {sig}{ellipsis}]{C.RESET}")
 
             # Print tool calls
             tool_calls = [b for b in response.content if isinstance(b, ToolUseBlock)]
