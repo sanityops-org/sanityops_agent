@@ -220,4 +220,5 @@ __marimo__/
 # claude
 .claude
 
+# Visual Studio Code
 .vscode

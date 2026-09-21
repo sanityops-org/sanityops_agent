@@ -157,7 +157,11 @@ class GeminiAdapter(MessageAdapter):
                     # Gemini FunctionResponse requires both id (call ID) and name (function name)
                     # We look up the function name from preceding ToolUseBlock
                     # ToolResultBlocks are always user-role messages in Gemini's protocol
-                    assert role == "user", "ToolResultBlock must be in user-role message for Gemini"
+                    if role != "user":
+                        raise ValueError(
+                            f"ToolResultBlock must be in a user-role message for Gemini, "
+                            f"got role={role!r}"
+                        )
 
                     fn_name = call_to_name.get(block.tool_call_id, block.tool_call_id)
                     normalized_id = self._normalize_tool_call_id(block.tool_call_id)

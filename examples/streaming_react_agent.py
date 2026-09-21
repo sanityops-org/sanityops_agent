@@ -2,7 +2,7 @@
 Streaming ReAct Agent — reads config from .env, runs agent with tools.
 
 Features:
-- Uses ParentAgent from SDK (no custom _call_llm needed)
+- Uses AgentFactory.create_parent_agent() from SDK (no custom _call_llm needed)
 - Colored logging via Hook mechanism
 - Supports OpenAI, Anthropic, and Gemini providers
 
@@ -144,7 +144,7 @@ class LoggingHook(Hook):
                 print(f"  Input: {json.dumps(ctx.tool_input)[:200]}")
 
         elif ctx.event == HookEvent.AFTER_TOOL_EXEC:
-            result = ctx.result or ""
+            result = str(ctx.result) if ctx.result else ""
             status = "❌" if ctx.is_error else "✓"
             colour = C.ERROR if ctx.is_error else C.OBSERVE
             print(f"\n{colour}{status} [OBSERVE] {result[:300]}{'...' if len(result) > 300 else ''}{C.RESET}")
