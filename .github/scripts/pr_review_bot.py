@@ -144,7 +144,7 @@ def run_review(payload: dict, diff: str) -> str:
         except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             if attempt == max_attempts:
                 # AI review is advisory — don't block the PR when the gateway
-                # quota is persistently exhausted. Post a notice instead.
+                # is persistently unavailable. Post a notice instead.
                 post_quota_notice(payload, e, max_attempts)
                 return ""
             # Respect Retry-After header if present, else exponential backoff
@@ -173,19 +173,28 @@ def run_review(payload: dict, diff: str) -> str:
 
 
 def post_quota_notice(payload: dict, error: Exception, attempts: int) -> None:
-    """Post a notice that the AI review was skipped due to API quota exhaustion."""
+    """Post a notice that the AI review was skipped due to API unavailability."""
     err_str = str(error)
     truncated = err_str[:500]
     ellipsis = "..." if len(err_str) > 500 else ""
+
+    # Differentiate error types for clearer messaging
+    if isinstance(error, RateLimitError):
+        reason = "LLM gateway quota exhausted"
+    elif isinstance(error, (APIConnectionError, APITimeoutError)):
+        reason = "LLM gateway unavailable (network issue)"
+    else:
+        reason = "LLM gateway error"
+
     body = (
         "## 🤖 Claude Code Review\n\n"
-        "⚠️ **AI review skipped**: the LLM gateway quota is exhausted "
+        f"⚠️ **AI review skipped**: {reason} "
         f"after {attempts} retries with exponential backoff.\n\n"
         "```\n"
         f"{truncated}{ellipsis}\n"
         "```\n"
-        "Lint and test checks are unaffected. Top up the gateway quota "
-        "(or check `ANTHROPIC_BASE_URL` provider settings) and re-run this check."
+        "Lint and test checks are unaffected. Check the error above and "
+        "re-run this check if the issue is transient."
     )
     try:
         post_review(payload, body)
