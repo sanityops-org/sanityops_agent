@@ -14,14 +14,54 @@ Run inside a GitHub Actions workflow. Requires the following env vars:
 
 import json
 import os
+import random
 import sys
+import time
 import urllib.error
 import urllib.request
 
-# Anthropic SDK
-from anthropic import Anthropic
+from anthropic import (
+    Anthropic,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
+
+# Cap on the exponential backoff delay between retries (seconds)
+# 2 minutes is a reasonable wait for gateway quota recovery while keeping
+# the CI check duration acceptable
+MAX_RETRY_DELAY = 120
+
+
+def extract_retry_after(exception: Exception) -> float | None:
+    """Extract the Retry-After delay (seconds) from an API error, if present.
+
+    Supports both delta-seconds (integer) and HTTP-date formats per RFC 7231.
+    """
+    headers = getattr(exception, "response", None)
+    headers = getattr(headers, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    # Try delta-seconds format first (most common)
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    # Fall back to HTTP-date format (e.g., "Wed, 21 Oct 2026 07:28:00 GMT")
+    try:
+        from email.utils import parsedate_to_datetime
+
+        retry_at = parsedate_to_datetime(value)
+        delay = retry_at.timestamp() - time.time()
+        return max(0.0, delay) if delay > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def read_inputs() -> dict:
@@ -77,13 +117,19 @@ def fetch_pr_diff(repo: str, pr_number: int, token: str) -> str:
 
 
 def run_review(payload: dict, diff: str) -> str:
-    """Call the Anthropic API to review the diff and return the review text."""
+    """Call the Anthropic API to review the diff and return the review text.
+
+    Retries transient API errors (rate limits, server errors, connection
+    issues) with exponential backoff so a momentary 429 on a third-party
+    gateway does not fail the whole CI check.
+    """
     pr_number = payload["pr_number"]
 
     # Initialize Anthropic client (SDK handles auth headers correctly)
     client = Anthropic(
         api_key=payload["api_key"],
         base_url=payload.get("base_url"),
+        max_retries=0,  # We implement our own retry loop below
     )
 
     system_prompt = (
@@ -99,12 +145,39 @@ def run_review(payload: dict, diff: str) -> str:
         f"```diff\n{diff}\n```"
     )
 
-    message = client.messages.create(
-        model=payload["model"],
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
+        try:
+            message = client.messages.create(
+                model=payload["model"],
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            break
+        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+            if attempt == max_attempts:
+                # AI review is advisory — don't block the PR when the gateway
+                # is persistently unavailable. Post a notice instead.
+                post_quota_notice(payload, e, max_attempts)
+                return ""
+            # Respect Retry-After header if present, else exponential backoff with jitter.
+            # Jitter (±25%) avoids thundering herd when many CI jobs retry
+            # simultaneously against the same rate-limited gateway.
+            base_delay = extract_retry_after(e) or min(2 ** attempt, MAX_RETRY_DELAY)
+            delay = base_delay * random.uniform(0.75, 1.25)
+            print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
+        except APIStatusError as e:
+            # Only retry on transient 5xx errors (500, 502, 503, 504)
+            # 501 Not Implemented, 505 HTTP Version Not Supported, etc. are not transient
+            transient_codes = {500, 502, 503, 504}
+            if e.status_code not in transient_codes or attempt == max_attempts:
+                raise
+            base_delay = min(2 ** attempt, MAX_RETRY_DELAY)
+            delay = base_delay * random.uniform(0.75, 1.25)
+            print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
 
     # Extract text from response
     text_parts = []
@@ -115,6 +188,37 @@ def run_review(payload: dict, diff: str) -> str:
     if not text:
         raise RuntimeError("Anthropic returned no text content")
     return text
+
+
+def post_quota_notice(payload: dict, error: Exception, attempts: int) -> None:
+    """Post a notice that the AI review was skipped due to API unavailability."""
+    err_str = str(error)
+    truncated = err_str[:500]
+    ellipsis = "..." if len(err_str) > 500 else ""
+
+    # Differentiate error types for clearer messaging
+    if isinstance(error, RateLimitError):
+        reason = "LLM gateway quota exhausted"
+    elif isinstance(error, (APIConnectionError, APITimeoutError)):
+        reason = "LLM gateway unavailable (network issue)"
+    else:
+        reason = "LLM gateway error"
+
+    body = (
+        "## 🤖 Claude Code Review\n\n"
+        f"⚠️ **AI review skipped**: {reason} "
+        f"after {attempts} retries with exponential backoff.\n\n"
+        "```\n"
+        f"{truncated}{ellipsis}\n"
+        "```\n"
+        "Lint and test checks are unaffected. Check the error above and "
+        "re-run this check if the issue is transient."
+    )
+    try:
+        post_review(payload, body)
+    except Exception as e:
+        print(f"Failed to post quota notice: {e}", file=sys.stderr)
+        raise
 
 
 def post_review(payload: dict, body: str) -> None:
@@ -156,11 +260,18 @@ def main() -> int:
             return 0
 
         review = run_review(payload, diff)
+        if not review:
+            # Quota notice was already posted by run_review
+            return 0
         post_review(payload, review)
         print("Review posted successfully.")
         return 0
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # 429 quota exhaustion etc. — fail the check but with a clear cause
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
 

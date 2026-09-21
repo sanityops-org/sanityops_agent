@@ -1,46 +1,36 @@
 """
-Streaming ReAct Agent — reads config from .env, streams LLM output with
-real-time logging of thought process, tool calls, and observations.
+Streaming ReAct Agent — reads config from .env, runs agent with tools.
+
+Features:
+- Uses AgentFactory.create_parent_agent() from SDK (no custom _call_llm needed)
+- Colored logging via Hook mechanism
+- Supports OpenAI, Anthropic, and Gemini providers
 
 Usage:
-    cp .env.example .env   # fill in your API key and base_url
-    uv run python examples/streaming_react_agent.py "What's 25 * 13?"
+    cp .env.example .env   # fill in your API key
+    uv run python examples/streaming_react_agent.py "List files in the current directory"
+    uv run python examples/streaming_react_agent.py "What is the capital of France?"
 """
-
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# .env configuration via pydantic-settings
-# ---------------------------------------------------------------------------
 from pydantic_settings import BaseSettings
 
 from sanityops_agent.agents.factory import AgentFactory
-from sanityops_agent.core.agent import (
-    AgentConfig,
-    AgentResult,
-    BaseAgent,
-)
-from sanityops_agent.core.message import (
-    ContentType,
-    FinishReason,
-    Message,
-    Role,
-    TextBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
-from sanityops_agent.llm.base import LLMProvider, LLMResponse
+from sanityops_agent.core.agent import AgentConfig
+from sanityops_agent.core.message import TextBlock, ThinkingBlock, ToolUseBlock
+from sanityops_agent.hooks.base import Hook, HookContext, HookEvent, HookExecutor
+from sanityops_agent.llm.base import LLMProvider
 from sanityops_agent.managers.history import ToolHistoryStore
 from sanityops_agent.managers.skill import SkillManager
 from sanityops_agent.managers.todo import TodoManager
-from sanityops_agent.tools.base import Tool, ToolResult
 from sanityops_agent.tools.builtins import (
     BashTool,
     FileOpsTool,
@@ -58,10 +48,18 @@ class AgentEnv(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # LLM provider
-    LLM_PROVIDER: str = "openai"  # "openai" | "anthropic"
+    LLM_PROVIDER: str = "openai"  # "openai" | "anthropic" | "gemini"
     API_KEY: str = ""
     BASE_URL: str = ""
     MODEL: str = "gpt-4o-mini"
+
+    # Gemini-specific (Vertex AI)
+    GOOGLE_CLOUD_PROJECT: str = ""
+    GOOGLE_CLOUD_LOCATION: str = ""
+
+    # Thinking configuration (Gemini 2.5+)
+    THINKING_BUDGET: int = 0  # 0 = disabled, -1 = dynamic, >0 = token budget
+    STORE_THINKING: bool = True
 
     # Agent behaviour
     MAX_LOOPS: int = 30
@@ -69,8 +67,7 @@ class AgentEnv(BaseSettings):
     TOTAL_TIMEOUT: int = 300
     TEMPERATURE: float = 0.7
     SYSTEM_PROMPT: str = (
-        "You are a helpful assistant. Use tools when needed. "
-        "Think step by step."
+        "You are a helpful assistant. Use tools when needed. Think step by step."
     )
 
 
@@ -89,48 +86,92 @@ class C:
     DIVIDER = "\033[2;90m"   # dim grey
 
 
+# Display limits for readable output
+MAX_THINKING_DISPLAY = 500
+MAX_TOOL_INPUT_DISPLAY = 200
+MAX_TOOL_RESULT_DISPLAY = 300
+MAX_SIGNATURE_DISPLAY = 20
+
+
 def _print_tag(tag: str, colour: str) -> None:
     print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
     print(f"{colour}{C.BOLD}{tag}{C.RESET}")
 
 
 # ---------------------------------------------------------------------------
-# Simple built-in tools for the demo
+# Logging Hook for colored output
 # ---------------------------------------------------------------------------
-class CalculatorTool(Tool):
-    """Evaluate a simple arithmetic expression safely."""
+class LoggingHook(Hook):
+    """Hook that prints colored logs for LLM calls, tool execution, and errors."""
 
-    name = "calculator"
-    description = "Evaluate a math expression. Only supports basic arithmetic (+ - * / ** %)."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "expression": {"type": "string", "description": "Math expression, e.g. '25 * 13'"},
-        },
-        "required": ["expression"],
+    name = "logging"
+    description = "Print colored logs for agent events"
+    priority = 0  # Run first
+    events = {
+        HookEvent.AFTER_LLM_CALL,
+        HookEvent.BEFORE_TOOL_EXEC,
+        HookEvent.AFTER_TOOL_EXEC,
+        HookEvent.ON_ERROR,
+        HookEvent.ON_TERMINATION,
     }
 
-    async def execute(self, expression: str, **kwargs: Any) -> ToolResult:
-        allowed = set("0123456789+-*/.()% ")
-        if any(c not in allowed for c in expression):
-            return ToolResult(content=f"Error: invalid characters in '{expression}'", success=False)
-        try:
-            result = eval(expression, {"__builtins__": {}}, {})
-            return ToolResult(content=str(result))
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", success=False)
+    async def handle(self, ctx: HookContext) -> HookContext:
+        if ctx.event == HookEvent.AFTER_LLM_CALL:
+            response = ctx.response
+            if not response or not response.content:
+                return ctx
 
+            # Print thinking blocks
+            for block in response.content:
+                if isinstance(block, ThinkingBlock):
+                    _print_tag("[THINK]", C.THINK)
+                    text = block.thinking
+                    print(f"{C.DIM}{text[:MAX_THINKING_DISPLAY]}{'...' if len(text) > MAX_THINKING_DISPLAY else ''}{C.RESET}")
+                    # Show signature if present
+                    if block.thinking_signature:
+                        sig = block.thinking_signature[:MAX_SIGNATURE_DISPLAY]
+                        ellipsis = "..." if len(block.thinking_signature) > MAX_SIGNATURE_DISPLAY else ""
+                        print(f"{C.DIM}  [signature: {sig}{ellipsis}]{C.RESET}")
 
-class CurrentTimeTool(Tool):
-    """Return the current local time."""
+            # Print text blocks
+            for block in response.content:
+                if isinstance(block, TextBlock):
+                    _print_tag("[TEXT]", C.ANSWER)
+                    print(block.text)
+                    # Show signature if present
+                    if block.text_signature:
+                        sig = block.text_signature[:MAX_SIGNATURE_DISPLAY]
+                        ellipsis = "..." if len(block.text_signature) > MAX_SIGNATURE_DISPLAY else ""
+                        print(f"{C.DIM}  [signature: {sig}{ellipsis}]{C.RESET}")
 
-    name = "current_time"
-    description = "Return the current local time as a string."
-    parameters = {"type": "object", "properties": {}, "required": []}
+            # Print tool calls
+            tool_calls = [b for b in response.content if isinstance(b, ToolUseBlock)]
+            if tool_calls:
+                for tc in tool_calls:
+                    sig_note = f" [sig: {tc.thought_signature[:MAX_SIGNATURE_DISPLAY]}...]" if tc.thought_signature else ""
+                    print(f"\n{C.ACT}→ Tool: {tc.tool_name}({json.dumps(tc.tool_input)}){sig_note}{C.RESET}")
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
-        from datetime import datetime
-        return ToolResult(content=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        elif ctx.event == HookEvent.BEFORE_TOOL_EXEC:
+            _print_tag(f"[ACT] Calling {ctx.tool_name}", C.ACT)
+            if ctx.tool_input:
+                print(f"  Input: {json.dumps(ctx.tool_input)[:MAX_TOOL_INPUT_DISPLAY]}")
+
+        elif ctx.event == HookEvent.AFTER_TOOL_EXEC:
+            result = str(ctx.result) if ctx.result else ""
+            status = "❌" if ctx.is_error else "✓"
+            colour = C.ERROR if ctx.is_error else C.OBSERVE
+            print(f"\n{colour}{status} [OBSERVE] {result[:MAX_TOOL_RESULT_DISPLAY]}{'...' if len(result) > MAX_TOOL_RESULT_DISPLAY else ''}{C.RESET}")
+
+        elif ctx.event == HookEvent.ON_ERROR:
+            _print_tag(f"[ERROR] {ctx.error}", C.ERROR)
+
+        elif ctx.event == HookEvent.ON_TERMINATION:
+            print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
+            reason = ctx.data.get("reason", "unknown") if ctx.data else "unknown"
+            print(f"{C.ANSWER}{C.BOLD}[DONE] {reason}{C.RESET}")
+
+        # Unhandled events (e.g., BEFORE_LLM_CALL) pass through unchanged
+        return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -138,189 +179,50 @@ class CurrentTimeTool(Tool):
 # ---------------------------------------------------------------------------
 def create_provider(env: AgentEnv) -> LLMProvider:
     """Instantiate an LLM provider from environment config."""
-    if env.LLM_PROVIDER.lower() == "anthropic":
+    provider_type = env.LLM_PROVIDER.lower()
+
+    if provider_type == "anthropic":
         from sanityops_agent.llm.providers.anthropic import AnthropicProvider
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return AnthropicProvider(**kwargs)
-    else:
+
+    elif provider_type == "gemini":
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        kwargs: dict[str, Any] = {
+            "api_key": env.API_KEY,
+            "model": env.MODEL,
+            "store_thinking": env.STORE_THINKING,
+        }
+        if env.THINKING_BUDGET != 0:
+            # Only -1 should map to None (dynamic budget), warn about other negative values
+            if env.THINKING_BUDGET < -1:
+                logging.getLogger(__name__).warning(
+                    "THINKING_BUDGET=%d is invalid. Only -1 (dynamic) or >0 (token budget) are valid. "
+                    "Defaulting to dynamic budget.",
+                    env.THINKING_BUDGET,
+                )
+            # -1 maps to None (dynamic budget), >0 maps to specific token budget
+            kwargs["thinking_budget"] = env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
+        if env.GOOGLE_CLOUD_PROJECT:
+            kwargs["project_id"] = env.GOOGLE_CLOUD_PROJECT
+            if env.GOOGLE_CLOUD_LOCATION:
+                kwargs["location"] = env.GOOGLE_CLOUD_LOCATION
+        return GeminiProvider(**kwargs)
+
+    else:  # openai (default)
+        if provider_type != "openai":
+            logging.getLogger(__name__).warning(
+                "Unknown LLM_PROVIDER '%s', defaulting to OpenAI. "
+                "Valid providers: openai, anthropic, gemini",
+                env.LLM_PROVIDER,
+            )
         from sanityops_agent.llm.providers.openai import OpenAIProvider
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return OpenAIProvider(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Streaming ReAct Agent
-# ---------------------------------------------------------------------------
-class StreamingReActAgent(BaseAgent):
-    """ReAct agent that streams the LLM output and logs each phase.
-
-    Overrides the BaseAgent loop to use provider.stream() and print
-    chunks in real-time:
-      [THINK]   — streaming text output
-      [ACT]     — tool name + arguments when tool_use detected
-      [OBSERVE] — tool result after execution
-      [ANSWER]  — final text answer
-    """
-
-    def __init__(
-        self,
-        config: AgentConfig,
-        provider: LLMProvider,
-        tool_registry: ToolRegistry,
-    ):
-        super().__init__(config)
-        self.provider = provider
-        self.tool_registry = tool_registry
-
-    # -- overrides required by Basesanityops_agent.run() --
-
-    async def _call_llm(self) -> LLMResponse:
-        """Stream the LLM response, print chunks in real-time, and buffer into LLMResponse."""
-        tool_defs = self.tool_registry.to_tool_definitions(
-            self.config.allowed_tool_tags,
-        )
-
-        # Buffers for streamed content
-        text_buffer: str = ""
-        thinking_buffer: str = ""
-        # key: tool index -> {name, input_str, tool_call_id}
-        tool_call_buffers: dict[int, dict[str, Any]] = {}
-        stop_reason = FinishReason.END_TURN
-
-        # Stream and print in real-time
-        _print_tag("[THINK]", C.THINK)
-        async for chunk in self.provider.stream(
-            self.context.messages, tools=tool_defs,
-        ):
-            if chunk.type == ContentType.THINKING and chunk.delta:
-                thinking_buffer += chunk.delta
-                print(f"{C.DIM}{chunk.delta}{C.RESET}", end="", flush=True)
-
-            elif chunk.type == ContentType.TEXT and chunk.delta:
-                text_buffer += chunk.delta
-                print(chunk.delta, end="", flush=True)
-
-            elif chunk.type == ContentType.TOOL_USE and chunk.delta:
-                # Identify which tool call this chunk belongs to
-                idx = chunk.index
-                if idx not in tool_call_buffers:
-                    tool_call_buffers[idx] = {
-                        "name": "",
-                        "input_str": "",
-                        "tool_call_id": chunk.tool_call_id or f"stream_call_{idx}",
-                    }
-
-                buf = tool_call_buffers[idx]
-
-                if isinstance(chunk.delta, dict):
-                    # OpenAI format: {"name": "...", "arguments": "..."}
-                    # Anthropic format: {"name": "...", "input": {...}}
-                    if "name" in chunk.delta:
-                        chunk_name = chunk.delta["name"]
-                        if chunk_name:
-                            buf["name"] = chunk_name
-
-                    # OpenAI uses "arguments" (string, incremental JSON fragment)
-                    if "arguments" in chunk.delta:
-                        buf["input_str"] += chunk.delta["arguments"]
-
-                    # Anthropic uses "input" (dict, full replacement each chunk)
-                    if "input" in chunk.delta:
-                        inp = chunk.delta["input"]
-                        buf["input_str"] = json.dumps(inp) if isinstance(inp, dict) else str(inp)
-
-                    # Track tool_call_id
-                    if chunk.tool_call_id:
-                        buf["tool_call_id"] = chunk.tool_call_id
-
-            elif chunk.finish_reason:
-                stop_reason = chunk.finish_reason
-
-        print()  # newline after thinking
-
-        # Build content blocks from buffered data
-        content: list = []
-        if text_buffer.strip():
-            content.append(TextBlock(text=text_buffer.strip()))
-
-        for idx in sorted(tool_call_buffers.keys()):
-            buf = tool_call_buffers[idx]
-            name = buf.get("name", "unknown_tool")
-            input_str = buf.get("input_str", "{}")
-            try:
-                tool_input = json.loads(input_str) if input_str else {}
-            except json.JSONDecodeError:
-                tool_input = {}
-            content.append(ToolUseBlock(
-                tool_call_id=buf.get("tool_call_id", f"stream_call_{idx}"),
-                tool_name=name,
-                tool_input=tool_input,
-            ))
-
-        return LLMResponse(
-            content=content,
-            stop_reason=stop_reason,
-            model=self.provider.model if hasattr(self.provider, "model") else "unknown",
-            usage={"total_tokens": 0},
-        )
-
-    async def _call_llm_with_retry(self):
-        """Agent-level retry with error logging."""
-        for attempt in range(self.config.max_retries):
-            try:
-                return await self._call_llm()
-            except Exception as e:
-                print(f"\n{C.ERROR}[ERROR] LLM call failed (attempt {attempt+1}/{self.config.max_retries}): {e}{C.RESET}")
-                self._record_error("llm_error", str(e), 0, recoverable=True)
-                if attempt == self.config.max_retries - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-
-    async def _execute_tools(self, tool_calls: list) -> None:
-        """Execute tools and log the observations."""
-        for tc in tool_calls:
-            tool_name = tc.tool_name
-            tool_input = tc.tool_input
-            tool_call_id = tc.tool_call_id
-
-            _print_tag(f"[ACT] Calling {tool_name}({json.dumps(tool_input)})", C.ACT)
-
-            tool = self.tool_registry.get(tool_name)
-            if tool is None:
-                result_content = f"Tool not found: {tool_name}"
-                is_error = True
-            else:
-                try:
-                    result = await tool.run(**tool_input)
-                    result_content = result.content
-                    is_error = not result.success
-                except Exception as e:
-                    result_content = f"Tool error: {e}"
-                    is_error = True
-
-            _print_tag(f"[OBSERVE] {result_content[:200]}{'...' if len(result_content) > 200 else ''}", C.OBSERVE)
-
-            # Anthropic requires tool results to be in user messages with tool_result
-            # content blocks. OpenAI requires role='tool'.
-            is_anthropic = type(self.provider).__name__ == "AnthropicProvider"
-            tool_result_role = Role.USER if is_anthropic else Role.TOOL
-
-            await self.context.add_message(
-                Message(
-                    role=tool_result_role,
-                    content=[
-                        ToolResultBlock(
-                            tool_call_id=tool_call_id,
-                            tool_result_content=result_content,
-                            is_error=is_error,
-                        )
-                    ],
-                )
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +241,12 @@ async def main():
         print(f"{C.ERROR}Error: API_KEY is not set in .env{C.RESET}")
         sys.exit(1)
 
-    # Build provider and tools
+    # Build provider
     provider = create_provider(env)
+
+    # Create hook executor with logging hook
+    hook_executor = HookExecutor()
+    hook_executor.register(LoggingHook())
 
     # Create shared context for tools
     tool_context = ToolContext()
@@ -349,27 +255,28 @@ async def main():
     tool_context.set("history_store", ToolHistoryStore())
     tool_context.set("agent_factory", AgentFactory(provider))
 
+    # Register tools
     registry = ToolRegistry(context=tool_context)
-    registry.register(CalculatorTool())
-    registry.register(CurrentTimeTool())
     registry.register(BashTool())
-    registry.register(FileOpsTool()),
-    registry.register(GlobTool()),
-    registry.register(HistoryTool()),
-    registry.register(SkillTool()),
-    registry.register(TodoTool()),
+    registry.register(FileOpsTool())
+    registry.register(GlobTool())
+    registry.register(HistoryTool())
+    registry.register(SkillTool())
+    registry.register(TodoTool())
     registry.register(TaskTool())
 
-    # Build config from env
-    config = AgentConfig(
-        max_loops=env.MAX_LOOPS,
-        max_tokens=env.MAX_TOKENS,
-        total_timeout=env.TOTAL_TIMEOUT,
-        system_prompt=env.SYSTEM_PROMPT,
+    # Build factory
+    factory = AgentFactory(
+        provider=provider,
+        config=AgentConfig(
+            max_loops=env.MAX_LOOPS,
+            max_tokens=env.MAX_TOKENS,
+            total_timeout=env.TOTAL_TIMEOUT,
+            system_prompt=env.SYSTEM_PROMPT,
+        ),
+        tool_registry=registry,
+        hook_executor=hook_executor,
     )
-
-    # Build streaming agent
-    agent = StreamingReActAgent(config, provider, registry)
 
     # Get user input from CLI args or stdin
     if len(sys.argv) > 1:
@@ -379,21 +286,24 @@ async def main():
 
     print(f"\n{C.DIM}{'═' * 60}{C.RESET}")
     print(f"{C.BOLD}Model: {env.MODEL} | Provider: {env.LLM_PROVIDER}{C.RESET}")
+    if env.LLM_PROVIDER == "gemini" and env.THINKING_BUDGET != 0:
+        print(f"{C.DIM}Thinking Budget: {env.THINKING_BUDGET} tokens{C.RESET}")
     print(f"{C.DIM}{'═' * 60}{C.RESET}")
 
-    # Run
+    # Create agent and run
+    agent = factory.create_parent_agent()
+
     t0 = time.time()
-    result: AgentResult = await agent.run(prompt)
+    result = await agent.run(prompt)
     elapsed = time.time() - t0
 
     # Final summary
     print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
-    print(f"{C.ANSWER}{C.BOLD}[ANSWER] Summary{C.RESET}")
+    print(f"{C.ANSWER}{C.BOLD}[SUMMARY]{C.RESET}")
     print(f"  Reason:       {result.termination_reason.value}")
     print(f"  Loops:        {result.loops_used}")
     print(f"  Time:         {elapsed:.2f}s")
-    if result.text:
-        print(f"\n{C.ANSWER}{result.text}{C.RESET}")
+    print(f"  Tokens:       {result.tokens_used}")
     if result.error:
         print(f"\n{C.ERROR}Error: {result.error}{C.RESET}")
     print(f"{C.DIVIDER}{'─' * 60}{C.RESET}")

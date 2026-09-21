@@ -44,12 +44,14 @@ class ContentBlock:
 class TextBlock(ContentBlock):
     type: ContentType = field(default=ContentType.TEXT, init=False)
     text: str
+    text_signature: str | None = None  # Gemini thoughtSignature on text parts
 
 
 @dataclass
 class ThinkingBlock(ContentBlock):
     type: ContentType = field(default=ContentType.THINKING, init=False)
     thinking: str
+    thinking_signature: str | None = None  # Gemini thoughtSignature for reasoning replay
 
 
 @dataclass
@@ -58,6 +60,7 @@ class ToolUseBlock(ContentBlock):
     tool_call_id: str
     tool_name: str
     tool_input: dict
+    thought_signature: str | None = None  # Gemini thoughtSignature on tool calls
 
 
 @dataclass
@@ -86,6 +89,7 @@ class Message:
     role: Role
     content: list[ContentBlockUnion]  # Force unified list format
     provider: str | None = None
+    model: str | None = None  # Model ID for cross-model signature handling
     raw_response: dict = field(default_factory=dict, repr=False)
 
     @classmethod

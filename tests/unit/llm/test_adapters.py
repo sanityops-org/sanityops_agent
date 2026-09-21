@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -1001,3 +1002,386 @@ class TestGeminiAdapterMapException:
         """Create a generic exception with the given class name."""
         exc_cls = type(cls_name, (Exception,), {})
         return exc_cls(msg)
+
+
+# ====================================================================
+# GeminiAdapter – thoughtSignature handling
+# ====================================================================
+
+
+class TestGeminiAdapterThoughtSignature:
+    """Tests for thoughtSignature handling in GeminiAdapter."""
+
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter(store_thinking=True, model_id="gemini-2.5-flash")
+
+    def test_thinking_block_with_signature_same_model(self, adapter):
+        """When same provider/model, thoughtSignature should be preserved."""
+        thinking = ThinkingBlock(
+            thinking="Let me think...",
+            thinking_signature="abc123==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider="google",
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        part = result["contents"][0]["parts"][0]
+        assert part["thought"] is True
+        assert part["text"] == "Let me think..."
+        assert part["thoughtSignature"] == "abc123=="
+
+    def test_thinking_block_cross_model_drops_signature(self, adapter):
+        """Cross-model thinking block should convert to plain text, no signature."""
+        thinking = ThinkingBlock(
+            thinking="Let me think...",
+            thinking_signature="abc123==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider="anthropic",  # Different provider
+            model="claude-3-sonnet",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        part = result["contents"][0]["parts"][0]
+        # Cross-model: becomes plain text, no thought flag or signature
+        assert "thought" not in part
+        assert part["text"] == "Let me think..."
+        assert "thoughtSignature" not in part
+
+    def test_text_block_with_signature_same_model(self, adapter):
+        """Text blocks can carry thoughtSignature for Gemini reasoning replay."""
+        text = TextBlock(
+            text="The answer is 42",
+            text_signature="sig456==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[text],
+            provider="google",
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        part = result["contents"][0]["parts"][0]
+        assert part["text"] == "The answer is 42"
+        assert part["thoughtSignature"] == "sig456=="
+
+    def test_tool_use_with_thought_signature(self, adapter):
+        """Tool calls can carry thoughtSignature."""
+        tool_use = ToolUseBlock(
+            tool_call_id="call_abc",
+            tool_name="search",
+            tool_input={"query": "test"},
+            thought_signature="toolSig==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[tool_use],
+            provider="google",
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        part = result["contents"][0]["parts"][0]
+        assert part["functionCall"]["name"] == "search"
+        assert part["thoughtSignature"] == "toolSig=="
+
+    def test_from_provider_response_extracts_thinking_signature(self, adapter):
+        """Response parsing should extract thoughtSignature."""
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "thought": True,
+                        "text": "Hmm...",
+                        "thoughtSignature": "respSig==",
+                    }]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-2.5-flash",
+        }
+        result = adapter.from_provider_response(response)
+
+        assert len(result.content) == 1
+        block = result.content[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "Hmm..."
+        assert block.thinking_signature == "respSig=="
+
+    def test_from_provider_response_extracts_text_signature(self, adapter):
+        """Response parsing should extract thoughtSignature from text parts."""
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "The answer",
+                        "thoughtSignature": "textSig==",
+                    }]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-2.5-flash",
+        }
+        result = adapter.from_provider_response(response)
+
+        assert len(result.content) == 1
+        block = result.content[0]
+        assert isinstance(block, TextBlock)
+        assert block.text == "The answer"
+        assert block.text_signature == "textSig=="
+
+    def test_from_provider_response_extracts_tool_signature(self, adapter):
+        """Response parsing should extract thoughtSignature from tool calls."""
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": {"q": "test"},
+                        },
+                        "thoughtSignature": "toolRespSig==",
+                    }]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-2.5-flash",
+        }
+        result = adapter.from_provider_response(response)
+
+        assert len(result.content) == 1
+        block = result.content[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.tool_name == "search"
+        assert block.thought_signature == "toolRespSig=="
+
+    def test_thinking_block_with_none_provider_drops_signature(self, adapter):
+        """If message provider is None, signature should be dropped."""
+        thinking = ThinkingBlock(
+            thinking="Hmm...",
+            thinking_signature="sig==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider=None,  # Legacy message without provider
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        # Should NOT have thoughtSignature (dropped due to None provider)
+        part = result["contents"][0]["parts"][0]
+        assert "thoughtSignature" not in part
+        assert part["text"] == "Hmm..."
+
+    def test_thinking_block_with_none_current_model_drops_signature(self, adapter):
+        """If current_model is None, signature should be dropped."""
+        thinking = ThinkingBlock(
+            thinking="Hmm...",
+            thinking_signature="sig==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider="google",
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model=None,  # Unknown current model
+        )
+
+        # Should NOT have thoughtSignature (dropped due to None current_model)
+        part = result["contents"][0]["parts"][0]
+        assert "thoughtSignature" not in part
+
+
+# ====================================================================
+# GeminiAdapter – tool call ID normalization
+# ====================================================================
+
+
+class TestGeminiAdapterToolCallIdNormalization:
+    """Tests for tool call ID normalization."""
+
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter(model_id="gemini-3.5-flash")
+
+    def test_normalize_special_characters(self, adapter):
+        """Special characters should be replaced with underscore."""
+        normalized = adapter._normalize_tool_call_id("call|with|pipes")
+        assert normalized == "call_with_pipes"
+
+    def test_normalize_truncates_long_id(self, adapter):
+        """IDs longer than 64 chars should be truncated with hash suffix to avoid collisions."""
+        long_id = "a" * 100
+        normalized = adapter._normalize_tool_call_id(long_id)
+        assert len(normalized) == 64
+        # First 53 chars are 'a', then underscore, then 10-char hash
+        assert normalized[:53] == "a" * 53
+        assert normalized[53] == "_"
+        assert len(normalized[54:]) == 10  # hash suffix
+
+    def test_normalize_preserves_valid_id(self, adapter):
+        """Valid IDs should pass through unchanged."""
+        valid_id = "call_abc-123_XYZ"
+        normalized = adapter._normalize_tool_call_id(valid_id)
+        assert normalized == valid_id
+
+    def test_tool_use_block_normalizes_id(self, adapter):
+        """Tool use blocks should have normalized IDs in output."""
+        tool_use = ToolUseBlock(
+            tool_call_id="call|with|special|chars",
+            tool_name="search",
+            tool_input={"query": "test"},
+        )
+        msg = Message(role=Role.ASSISTANT, content=[tool_use])
+        result = adapter.to_provider([msg])
+
+        fc = result["contents"][0]["parts"][0]["functionCall"]
+        assert fc["id"] == "call_with_special_chars"
+
+    def test_normalize_exactly_64_chars(self, adapter):
+        """IDs exactly 64 chars should pass through unchanged."""
+        exact_id = "a" * 64
+        normalized = adapter._normalize_tool_call_id(exact_id)
+        assert normalized == exact_id
+        assert len(normalized) == 64
+
+    def test_normalize_special_chars_at_end(self, adapter):
+        """Special characters at the end should be replaced."""
+        normalized = adapter._normalize_tool_call_id("call_123|@#$")
+        assert normalized == "call_123____"
+        assert re.match(r"^[a-zA-Z0-9_-]+$", normalized)
+
+    def test_normalize_empty_string(self, adapter):
+        """Empty string should return a placeholder."""
+        normalized = adapter._normalize_tool_call_id("")
+        assert normalized == "empty_call"
+
+    def test_normalize_whitespace_only(self, adapter):
+        """Whitespace-only string should normalize to underscores then placeholder if empty."""
+        # All spaces become underscores, so not empty after normalization
+        normalized = adapter._normalize_tool_call_id("   ")
+        assert normalized == "___"
+        # Empty after normalization would hit the empty check
+        normalized = adapter._normalize_tool_call_id("")
+        assert normalized == "empty_call"
+
+
+# ====================================================================
+# GeminiAdapter – tool result merging
+# ====================================================================
+
+
+class TestGeminiAdapterToolResultMerging:
+    """Tests for consecutive tool result merging."""
+
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_consecutive_tool_results_merged(self, adapter):
+        """Multiple tool results should be merged into one user turn."""
+        tool_use_1 = ToolUseBlock(
+            tool_call_id="call_1",
+            tool_name="search",
+            tool_input={"q": "a"},
+        )
+        tool_use_2 = ToolUseBlock(
+            tool_call_id="call_2",
+            tool_name="search",
+            tool_input={"q": "b"},
+        )
+        tool_result_1 = ToolResultBlock(
+            tool_call_id="call_1",
+            tool_result_content="Result A",
+        )
+        tool_result_2 = ToolResultBlock(
+            tool_call_id="call_2",
+            tool_result_content="Result B",
+        )
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_use_1, tool_use_2]),
+            Message(role=Role.USER, content=[tool_result_1, tool_result_2]),
+        ]
+        result = adapter.to_provider(messages)
+
+        # Should have 2 contents: 1 model turn + 1 merged user turn
+        assert len(result["contents"]) == 2
+        assert result["contents"][0]["role"] == "model"
+        assert result["contents"][1]["role"] == "user"
+
+        # The user turn should have both function responses
+        user_parts = result["contents"][1]["parts"]
+        assert len(user_parts) == 2
+        assert user_parts[0]["functionResponse"]["name"] == "search"
+        assert user_parts[1]["functionResponse"]["name"] == "search"
+
+    def test_single_tool_result_not_merged(self, adapter):
+        """Single tool result should create its own user turn."""
+        tool_use = ToolUseBlock(
+            tool_call_id="call_1",
+            tool_name="search",
+            tool_input={"q": "test"},
+        )
+        tool_result = ToolResultBlock(
+            tool_call_id="call_1",
+            tool_result_content="Result",
+        )
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_use]),
+            Message(role=Role.USER, content=[tool_result]),
+        ]
+        result = adapter.to_provider(messages)
+
+        # Single tool result creates its own turn
+        assert len(result["contents"]) == 2
+        assert result["contents"][1]["role"] == "user"
+        assert len(result["contents"][1]["parts"]) == 1
+
+    def test_tool_result_in_non_user_role_raises(self, adapter):
+        """ToolResultBlock in non-user role should raise ValueError."""
+        tool_result = ToolResultBlock(
+            tool_call_id="call_1",
+            tool_result_content="Result",
+        )
+        # ToolResultBlock in ASSISTANT role is invalid for Gemini
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_result]),
+        ]
+        with pytest.raises(ValueError, match="ToolResultBlock must be in a user-role message"):
+            adapter.to_provider(messages)

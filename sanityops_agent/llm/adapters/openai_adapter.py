@@ -212,6 +212,7 @@ class OpenAIAdapter(MessageAdapter):
             content=content,
             stop_reason=finish_reason,
             model=raw.get("model", "unknown"),
+            provider="openai",
             usage=dict(usage) if usage else {},
             raw_response=raw,
         )
@@ -325,6 +326,7 @@ class OpenAIAdapter(MessageAdapter):
             content=content,
             stop_reason=finish_reason,
             model=response.model or "unknown",
+            provider="openai",
             usage=usage,
             raw_response=response.model_dump(),
         )

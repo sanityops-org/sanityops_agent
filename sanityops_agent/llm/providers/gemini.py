@@ -52,7 +52,7 @@ class GeminiProvider(LLMProvider):
         self.store_thinking = store_thinking
         self.timeout = timeout
         self._client: genai.Client | None = None
-        self.adapter = GeminiAdapter(store_thinking=store_thinking)
+        self.adapter = GeminiAdapter(store_thinking=store_thinking, model_id=model)
 
     def _build_config(
         self, payload: dict, kwargs: dict
@@ -141,7 +141,12 @@ class GeminiProvider(LLMProvider):
     ) -> LLMResponse:
         """Non-streaming call to Gemini API."""
         client = self._get_client()
-        payload = self.adapter.to_provider(messages, tools)
+        payload = self.adapter.to_provider(
+            messages,
+            tools,
+            current_provider="google",
+            current_model=self.model,
+        )
         config = self._build_config(payload, kwargs)
 
         contents = [types.Content.model_validate(c) for c in payload["contents"]]
@@ -166,7 +171,12 @@ class GeminiProvider(LLMProvider):
     ) -> AsyncIterator[StreamChunk]:
         """Streaming call to Gemini API."""
         client = self._get_client()
-        payload = self.adapter.to_provider(messages, tools)
+        payload = self.adapter.to_provider(
+            messages,
+            tools,
+            current_provider="google",
+            current_model=self.model,
+        )
         config = self._build_config(payload, kwargs)
 
         contents = [types.Content.model_validate(c) for c in payload["contents"]]
