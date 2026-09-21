@@ -1,6 +1,6 @@
 [project]
 name = "sanityops_agent"
-version = "0.0.5"
+version = "0.0.6"
 description = "A modular, extensible AI Agent framework with multi-provider support and plugin architecture"
 readme = "README.md"
 requires-python = ">=3.11"
