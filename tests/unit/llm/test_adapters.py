@@ -1204,10 +1204,10 @@ class TestGeminiAdapterToolCallIdNormalization:
         long_id = "a" * 100
         normalized = adapter._normalize_tool_call_id(long_id)
         assert len(normalized) == 64
-        # First 56 chars are 'a', then underscore, then 7-char hash
-        assert normalized[:56] == "a" * 56
-        assert normalized[56] == "_"
-        assert len(normalized[57:]) == 7  # hash suffix
+        # First 53 chars are 'a', then underscore, then 10-char hash
+        assert normalized[:53] == "a" * 53
+        assert normalized[53] == "_"
+        assert len(normalized[54:]) == 10  # hash suffix
 
     def test_normalize_preserves_valid_id(self, adapter):
         """Valid IDs should pass through unchanged."""
