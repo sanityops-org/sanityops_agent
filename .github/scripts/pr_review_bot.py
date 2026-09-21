@@ -30,6 +30,8 @@ from anthropic import (
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
 # Cap on the exponential backoff delay between retries (seconds)
+# 2 minutes is a reasonable wait for gateway quota recovery while keeping
+# the CI check duration acceptable
 MAX_RETRY_DELAY = 120
 
 
