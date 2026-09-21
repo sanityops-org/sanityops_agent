@@ -20,6 +20,7 @@ import urllib.request
 
 # Anthropic SDK
 from anthropic import Anthropic
+import anthropic
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
@@ -77,13 +78,21 @@ def fetch_pr_diff(repo: str, pr_number: int, token: str) -> str:
 
 
 def run_review(payload: dict, diff: str) -> str:
-    """Call the Anthropic API to review the diff and return the review text."""
+    """Call the Anthropic API to review the diff and return the review text.
+
+    Retries transient API errors (rate limits, server errors, connection
+    issues) with exponential backoff so a momentary 429 on a third-party
+    gateway does not fail the whole CI check.
+    """
+    import time
+
     pr_number = payload["pr_number"]
 
     # Initialize Anthropic client (SDK handles auth headers correctly)
     client = Anthropic(
         api_key=payload["api_key"],
         base_url=payload.get("base_url"),
+        max_retries=0,  # We implement our own retry loop below
     )
 
     system_prompt = (
@@ -99,12 +108,28 @@ def run_review(payload: dict, diff: str) -> str:
         f"```diff\n{diff}\n```"
     )
 
-    message = client.messages.create(
-        model=payload["model"],
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            message = client.messages.create(
+                model=payload["model"],
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            break
+        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            if attempt == max_attempts:
+                raise
+            delay = min(2 ** attempt, 30)
+            print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
+            time.sleep(delay)
+        except anthropic.APIStatusError as e:
+            if e.status_code < 500 or attempt == max_attempts:
+                raise
+            delay = min(2 ** attempt, 30)
+            print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
+            time.sleep(delay)
 
     # Extract text from response
     text_parts = []
