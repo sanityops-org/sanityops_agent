@@ -136,6 +136,11 @@ class GeminiAdapter(MessageAdapter):
                         parts.append({"thought": True, "text": block.thinking})
                     else:
                         # Cross-provider/model: signature unusable, emit as text
+                        logger.warning(
+                            "Cross-model ThinkingBlock converted to text (signature dropped). "
+                            "Thinking semantics may be lost for model %s.",
+                            current_model,
+                        )
                         parts.append({"text": block.thinking})
 
                 elif isinstance(block, ToolUseBlock):
@@ -156,11 +161,15 @@ class GeminiAdapter(MessageAdapter):
                 elif isinstance(block, ToolResultBlock):
                     # Gemini FunctionResponse requires both id (call ID) and name (function name)
                     # We look up the function name from preceding ToolUseBlock
-                    # ToolResultBlocks are always user-role messages in Gemini's protocol
+                    # ToolResultBlocks must be in user-role messages for Gemini
                     if role != "user":
+                        logger.warning(
+                            "ToolResultBlock in non-user role (%s) - this indicates a bug in message construction",
+                            role,
+                        )
                         raise ValueError(
                             f"ToolResultBlock must be in a user-role message for Gemini, "
-                            f"got role={role!r}"
+                            f"got role={role!r}. Check message construction logic."
                         )
 
                     fn_name = call_to_name.get(block.tool_call_id, block.tool_call_id)

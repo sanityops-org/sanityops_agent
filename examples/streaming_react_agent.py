@@ -154,7 +154,8 @@ class LoggingHook(Hook):
 
         elif ctx.event == HookEvent.ON_TERMINATION:
             print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
-            print(f"{C.ANSWER}{C.BOLD}[DONE] {ctx.data.get('reason', 'unknown')}{C.RESET}")
+            reason = ctx.data.get("reason", "unknown") if ctx.data else "unknown"
+            print(f"{C.ANSWER}{C.BOLD}[DONE] {reason}{C.RESET}")
 
         return ctx
 

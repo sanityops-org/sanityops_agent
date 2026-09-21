@@ -128,7 +128,10 @@ def run_review(payload: dict, diff: str) -> str:
             print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
             time.sleep(delay)
         except APIStatusError as e:
-            if e.status_code < 500 or attempt == max_attempts:
+            # Only retry on transient 5xx errors (500, 502, 503, 504)
+            # 501 Not Implemented, 505 HTTP Version Not Supported, etc. are not transient
+            transient_codes = {500, 502, 503, 504}
+            if e.status_code not in transient_codes or attempt == max_attempts:
                 raise
             delay = min(2 ** attempt, 30)
             print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
