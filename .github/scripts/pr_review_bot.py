@@ -31,8 +31,6 @@ DEFAULT_MODEL = "claude-sonnet-4-5"
 
 # Cap on the exponential backoff delay between retries (seconds)
 MAX_RETRY_DELAY = 120
-# Truncate very large diffs so a single review stays within quota-friendly size
-MAX_DIFF_CHARS = 60_000
 
 
 def extract_retry_after(exception: Exception) -> float | None:
@@ -48,18 +46,6 @@ def extract_retry_after(exception: Exception) -> float | None:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return None
-
-
-def truncate_diff(diff: str, limit: int = MAX_DIFF_CHARS) -> str:
-    """Keep the head and tail of oversized diffs, with an elision marker."""
-    if len(diff) <= limit:
-        return diff
-    head = diff[: limit * 2 // 3]
-    tail = diff[-limit // 3:]
-    omitted = len(diff) - len(head) - len(tail)
-    return (
-        f"{head}\n\n[... {omitted} characters omitted for brevity ...]\n\n{tail}"
-    )
 
 
 def read_inputs() -> dict:
@@ -140,7 +126,7 @@ def run_review(payload: dict, diff: str) -> str:
     )
     user_prompt = (
         f"Here is the diff for PR #{pr_number}:\n\n"
-        f"```diff\n{truncate_diff(diff)}\n```"
+        f"```diff\n{diff}\n```"
     )
 
     max_attempts = 6
