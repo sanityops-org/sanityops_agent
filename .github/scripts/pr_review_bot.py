@@ -155,7 +155,10 @@ def run_review(payload: dict, diff: str) -> str:
             break
         except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             if attempt == max_attempts:
-                raise
+                # AI review is advisory — don't block the PR when the gateway
+                # quota is persistently exhausted. Post a notice instead.
+                post_quota_notice(payload, e)
+                return ""
             # Respect Retry-After header if present, else exponential backoff
             delay = extract_retry_after(e) or min(2 ** attempt, MAX_RETRY_DELAY)
             print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
@@ -179,6 +182,21 @@ def run_review(payload: dict, diff: str) -> str:
     if not text:
         raise RuntimeError("Anthropic returned no text content")
     return text
+
+
+def post_quota_notice(payload: dict, error: Exception) -> None:
+    """Post a notice that the AI review was skipped due to API quota exhaustion."""
+    body = (
+        "## 🤖 Claude Code Review\n\n"
+        "⚠️ **AI review skipped**: the LLM gateway quota is exhausted "
+        f"after {6} retries with exponential backoff.\n\n"
+        "```\n"
+        f"{str(error)[:500]}\n"
+        "```\n"
+        "Lint and test checks are unaffected. Top up the gateway quota "
+        "(or check `ANTHROPIC_BASE_URL` provider settings) and re-run this check."
+    )
+    post_review(payload, body)
 
 
 def post_review(payload: dict, body: str) -> None:
@@ -220,6 +238,9 @@ def main() -> int:
             return 0
 
         review = run_review(payload, diff)
+        if not review:
+            # Quota notice was already posted by run_review
+            return 0
         post_review(payload, review)
         print("Review posted successfully.")
         return 0
