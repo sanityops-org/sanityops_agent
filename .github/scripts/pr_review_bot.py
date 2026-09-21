@@ -172,8 +172,14 @@ def run_review(payload: dict, diff: str) -> str:
             # Only retry on transient 5xx errors (500, 502, 503, 504)
             # 501 Not Implemented, 505 HTTP Version Not Supported, etc. are not transient
             transient_codes = {500, 502, 503, 504}
-            if e.status_code not in transient_codes or attempt == max_attempts:
+            if e.status_code not in transient_codes:
+                # Non-transient errors should fail the check
                 raise
+            if attempt == max_attempts:
+                # AI review is advisory — don't block the PR when the gateway
+                # is persistently unavailable. Post a notice instead.
+                post_quota_notice(payload, e, max_attempts)
+                return ""
             base_delay = min(2 ** attempt, MAX_RETRY_DELAY)
             delay = base_delay * random.uniform(0.75, 1.25)
             print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay:.1f}s", file=sys.stderr)
