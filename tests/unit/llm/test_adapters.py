@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -1226,6 +1227,19 @@ class TestGeminiAdapterToolCallIdNormalization:
 
         fc = result["contents"][0]["parts"][0]["functionCall"]
         assert fc["id"] == "call_with_special_chars"
+
+    def test_normalize_exactly_64_chars(self, adapter):
+        """IDs exactly 64 chars should pass through unchanged."""
+        exact_id = "a" * 64
+        normalized = adapter._normalize_tool_call_id(exact_id)
+        assert normalized == exact_id
+        assert len(normalized) == 64
+
+    def test_normalize_special_chars_at_end(self, adapter):
+        """Special characters at the end should be replaced."""
+        normalized = adapter._normalize_tool_call_id("call_123|@#$")
+        assert normalized == "call_123____"
+        assert re.match(r"^[a-zA-Z0-9_-]+$", normalized)
 
 
 # ====================================================================
