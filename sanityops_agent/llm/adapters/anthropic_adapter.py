@@ -153,6 +153,7 @@ class AnthropicAdapter(MessageAdapter):
             content=content,
             stop_reason=stop_reason,
             model=raw.get("model", "unknown"),
+            provider="anthropic",
             usage=dict(usage) if usage else {},
             raw_response=raw,
         )
@@ -265,6 +266,7 @@ class AnthropicAdapter(MessageAdapter):
             content=content,
             stop_reason=self._map_stop_reason(response.stop_reason),
             model=response.model or "unknown",
+            provider="anthropic",
             usage=usage,
             raw_response=response.model_dump(),
         )

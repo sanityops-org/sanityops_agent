@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from sanityops_agent.core.message import (
@@ -28,6 +29,9 @@ from sanityops_agent.llm.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+# Gemini model version pattern for feature detection
+_GEMINI_VERSION_PATTERN = re.compile(r"^gemini(?:-live)?-(\d+)", re.IGNORECASE)
+
 
 class GeminiAdapter(MessageAdapter):
     """Google Gemini API message adapter.
@@ -36,14 +40,44 @@ class GeminiAdapter(MessageAdapter):
     - system instruction: {"systemInstruction": {"parts": [{"text": "..."}]}}
     - contents: [{"role": "user" | "model", "parts": [...]}]
     - role: ASSISTANT -> "model"
-    - TextBlock -> {"text": "..."}
-    - ThinkingBlock -> {"thought": "..."} (Gemini 2.5+ native format)
-    - ToolUseBlock -> {"functionCall": {"name": "...", "args": {...}}}
+    - TextBlock -> {"text": "..."} (with optional thoughtSignature)
+    - ThinkingBlock -> {"thought": "..."} (Gemini 2.5+ native format, with optional thoughtSignature)
+    - ToolUseBlock -> {"functionCall": {"id": "...", "name": "...", "args": {...}}}
     - ToolResultBlock -> {"functionResponse": {"name": "...", "response": {...}}}
     """
 
-    def __init__(self, store_thinking: bool = False):
+    def __init__(self, store_thinking: bool = False, model_id: str | None = None):
         self.store_thinking = store_thinking
+        self.model_id = model_id
+
+    def _requires_tool_call_id(self, model_id: str | None) -> bool:
+        """Check if the model requires explicit tool call IDs.
+
+        Gemini 3+, Claude, and GPT-OSS models require explicit IDs in function calls/responses.
+        """
+        if not model_id:
+            return True  # Default to including IDs for safety
+        match = _GEMINI_VERSION_PATTERN.match(model_id)
+        if match:
+            return int(match.group(1)) >= 3
+        return model_id.startswith("claude-") or model_id.startswith("gpt-oss-")
+
+    def _normalize_tool_call_id(self, id: str) -> str:
+        """Normalize tool call ID to Gemini-compatible format.
+
+        Gemini requires IDs matching ^[a-zA-Z0-9_-]{1,64}$
+        """
+        normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", id)
+        return normalized[:64]
+
+    def _is_same_provider_and_model(
+        self, msg: Message, current_provider: str | None, current_model: str | None
+    ) -> bool:
+        """Check if a message is from the same provider and model.
+
+        Only keep thoughtSignature when provider AND model match exactly.
+        """
+        return msg.provider == current_provider and msg.model == current_model
 
     def to_provider(
         self,
@@ -53,8 +87,17 @@ class GeminiAdapter(MessageAdapter):
     ) -> dict:
         """Convert messages to Gemini API format.
 
+        Supports:
+        - thoughtSignature preservation (same provider/model only)
+        - Tool call ID normalization for Gemini 3+ compatibility
+        - Consecutive function response merging
+
         Returns: {"systemInstruction": {...}, "contents": [...], "tools": [...]}
         """
+        # Extract model info for cross-model signature handling
+        current_provider: str | None = kwargs.get("current_provider", "google")
+        current_model: str | None = kwargs.get("current_model", self.model_id)
+
         # First pass: build tool_call_id -> tool_name mapping
         # Gemini requires function NAME in the response, but ToolResultBlock only has tool_call_id
         call_to_name: dict[str, str] = {}
@@ -79,32 +122,78 @@ class GeminiAdapter(MessageAdapter):
             role = "model" if msg.role == Role.ASSISTANT else "user"
             parts: list[dict] = []
 
+            # Check if message is from same provider/model for signature handling
+            is_same_model = self._is_same_provider_and_model(
+                msg, current_provider, current_model
+            )
+
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    parts.append({"text": block.text})
+                    # Handle text with optional thoughtSignature
+                    if is_same_model and block.text_signature:
+                        parts.append({
+                            "text": block.text,
+                            "thoughtSignature": block.text_signature,
+                        })
+                    else:
+                        parts.append({"text": block.text})
+
                 elif isinstance(block, ThinkingBlock):
-                    parts.append({"thought": block.thinking})
+                    # Handle thinking with optional thoughtSignature
+                    # Cross-model: convert to plain text, drop signature
+                    if is_same_model and block.thinking_signature:
+                        parts.append({
+                            "thought": True,
+                            "text": block.thinking,
+                            "thoughtSignature": block.thinking_signature,
+                        })
+                    elif is_same_model:
+                        parts.append({"thought": True, "text": block.thinking})
+                    else:
+                        # Cross-provider/model: signature unusable, emit as text
+                        parts.append({"text": block.thinking})
+
                 elif isinstance(block, ToolUseBlock):
-                    parts.append({
+                    # Normalize tool call ID for Gemini compatibility
+                    normalized_id = self._normalize_tool_call_id(block.tool_call_id)
+                    part: dict = {
                         "functionCall": {
-                            "id": block.tool_call_id,
+                            "id": normalized_id,
                             "name": block.tool_name,
                             "args": block.tool_input,
                         }
-                    })
+                    }
+                    # Add thoughtSignature if present and same model
+                    if is_same_model and block.thought_signature:
+                        part["thoughtSignature"] = block.thought_signature
+                    parts.append(part)
+
                 elif isinstance(block, ToolResultBlock):
                     # Gemini FunctionResponse requires both id (call ID) and name (function name)
                     # We look up the function name from preceding ToolUseBlock
                     fn_name = call_to_name.get(block.tool_call_id, block.tool_call_id)
-                    parts.append({
+                    normalized_id = self._normalize_tool_call_id(block.tool_call_id)
+                    part = {
                         "functionResponse": {
-                            "id": block.tool_call_id,
+                            "id": normalized_id,
                             "name": fn_name,
                             "response": {
                                 "result": block.tool_result_content,
                             },
                         }
-                    })
+                    }
+
+                    # Merge consecutive function responses into same user turn
+                    # (required for Cloud Code Assist API compatibility)
+                    last_content = contents[-1] if contents else None
+                    if (
+                        last_content
+                        and last_content["role"] == "user"
+                        and any("functionResponse" in p for p in last_content["parts"])
+                    ):
+                        last_content["parts"].append(part)
+                    else:
+                        parts.append(part)
 
             if parts:
                 contents.append({"role": role, "parts": parts})
@@ -141,6 +230,8 @@ class GeminiAdapter(MessageAdapter):
 
         The caller passes ``response.model_dump(by_alias=True, exclude_none=True)``
         so keys are camelCase (``functionCall``, ``finishReason``, ``modelVersion``).
+
+        Extracts thoughtSignature from parts when present.
         """
         candidates = raw.get("candidates", [])
         if not candidates:
@@ -148,6 +239,7 @@ class GeminiAdapter(MessageAdapter):
                 content=[],
                 stop_reason=FinishReason.END_TURN,
                 model=raw.get("modelVersion", "unknown"),
+                provider="google",
                 usage={},
                 raw_response=raw,
             )
@@ -162,10 +254,16 @@ class GeminiAdapter(MessageAdapter):
             # must be checked BEFORE the text branch.
             if part.get("thought") is True:
                 if self.store_thinking and part.get("text"):
-                    content.append(ThinkingBlock(thinking=part["text"]))
+                    content.append(ThinkingBlock(
+                        thinking=part["text"],
+                        thinking_signature=part.get("thoughtSignature"),
+                    ))
                 continue
             if "text" in part and part.get("text") is not None:
-                content.append(TextBlock(text=part["text"]))
+                content.append(TextBlock(
+                    text=part["text"],
+                    text_signature=part.get("thoughtSignature"),
+                ))
             elif "functionCall" in part:
                 fc = part["functionCall"]
                 content.append(
@@ -173,6 +271,7 @@ class GeminiAdapter(MessageAdapter):
                         tool_call_id=fc.get("id") or fc.get("name", ""),
                         tool_name=fc.get("name", ""),
                         tool_input=fc.get("args") or {},
+                        thought_signature=part.get("thoughtSignature"),
                     )
                 )
 
@@ -181,6 +280,7 @@ class GeminiAdapter(MessageAdapter):
             content=content,
             stop_reason=finish_reason,
             model=raw.get("modelVersion", "unknown"),
+            provider="google",
             usage=usage,
             raw_response=raw,
         )

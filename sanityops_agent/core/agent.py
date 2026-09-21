@@ -112,7 +112,12 @@ class BaseAgent(ABC):
             if not response.content and not response.has_tool_calls:
                 continue
             await self.context.add_message(
-                Message(role=Role.ASSISTANT, content=response.content)
+                Message(
+                    role=Role.ASSISTANT,
+                    content=response.content,
+                    provider=response.provider,
+                    model=response.model,
+                )
             )
 
             # Termination check after LLM returns (feedback point 13)

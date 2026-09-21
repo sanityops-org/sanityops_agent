@@ -47,6 +47,7 @@ class LLMResponse:
     content: list[ContentBlockUnion]
     stop_reason: FinishReason
     model: str
+    provider: str = "unknown"  # Provider name for thoughtSignature handling
     usage: dict = field(default_factory=dict)
     raw_response: dict = field(default_factory=dict, repr=False)
 

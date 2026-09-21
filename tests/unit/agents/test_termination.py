@@ -27,12 +27,15 @@ class DummyResponse:
 
     def __init__(self, stop_reason: FinishReason = FinishReason.END_TURN,
                  has_tool_calls: bool = False, tool_calls: list | None = None,
-                 text: str = "hello", content: list | None = None):
+                 text: str = "hello", content: list | None = None,
+                 model: str = "test-model", provider: str = "test"):
         self.stop_reason = stop_reason
         self.has_tool_calls = has_tool_calls
         self._tool_calls = tool_calls or []
         self._text = text
         self.content = content if content is not None else [TextBlock(text=text)]
+        self.model = model
+        self.provider = provider
 
     def get_tool_calls(self):
         return self._tool_calls
