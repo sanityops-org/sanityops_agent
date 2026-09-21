@@ -15,11 +15,16 @@ Run inside a GitHub Actions workflow. Requires the following env vars:
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
-import anthropic
-from anthropic import Anthropic
+from anthropic import (
+    Anthropic,
+    APIConnectionError,
+    APIStatusError,
+    RateLimitError,
+)
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
@@ -83,8 +88,6 @@ def run_review(payload: dict, diff: str) -> str:
     issues) with exponential backoff so a momentary 429 on a third-party
     gateway does not fail the whole CI check.
     """
-    import time
-
     pr_number = payload["pr_number"]
 
     # Initialize Anthropic client (SDK handles auth headers correctly)
@@ -117,13 +120,13 @@ def run_review(payload: dict, diff: str) -> str:
                 messages=[{"role": "user", "content": user_prompt}],
             )
             break
-        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+        except (RateLimitError, APIConnectionError) as e:
             if attempt == max_attempts:
                 raise
             delay = min(2 ** attempt, 30)
             print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
             time.sleep(delay)
-        except anthropic.APIStatusError as e:
+        except APIStatusError as e:
             if e.status_code < 500 or attempt == max_attempts:
                 raise
             delay = min(2 ** attempt, 30)
