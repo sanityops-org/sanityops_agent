@@ -18,9 +18,8 @@ import sys
 import urllib.error
 import urllib.request
 
-# Anthropic SDK
-from anthropic import Anthropic
 import anthropic
+from anthropic import Anthropic
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
