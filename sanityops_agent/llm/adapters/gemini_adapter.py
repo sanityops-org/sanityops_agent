@@ -154,7 +154,8 @@ class GeminiAdapter(MessageAdapter):
                         parts.append({"thought": True, "text": block.thinking})
                     else:
                         # Cross-provider/model: signature unusable, emit as text
-                        logger.warning(
+                        # Debug level since this is expected when switching models
+                        logger.debug(
                             "Cross-model ThinkingBlock converted to text (signature dropped). "
                             "Thinking semantics may be lost for model %s.",
                             current_model,
