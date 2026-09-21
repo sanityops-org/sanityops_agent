@@ -169,7 +169,7 @@ def run_review(payload: dict, diff: str) -> str:
             transient_codes = {500, 502, 503, 504}
             if e.status_code not in transient_codes or attempt == max_attempts:
                 raise
-            delay = min(2 ** attempt, 30)
+            delay = min(2 ** attempt, MAX_RETRY_DELAY)
             print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
             time.sleep(delay)
 
@@ -199,7 +199,11 @@ def post_quota_notice(payload: dict, error: Exception, attempts: int) -> None:
         "Lint and test checks are unaffected. Top up the gateway quota "
         "(or check `ANTHROPIC_BASE_URL` provider settings) and re-run this check."
     )
-    post_review(payload, body)
+    try:
+        post_review(payload, body)
+    except Exception as e:
+        print(f"Failed to post quota notice: {e}", file=sys.stderr)
+        raise
 
 
 def post_review(payload: dict, body: str) -> None:
