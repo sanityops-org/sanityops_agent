@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -194,7 +195,6 @@ def create_provider(env: AgentEnv) -> LLMProvider:
         }
         if env.THINKING_BUDGET != 0:
             # Only -1 should map to None (dynamic budget), warn about other negative values
-            import logging
             if env.THINKING_BUDGET < -1:
                 logging.getLogger(__name__).warning(
                     "THINKING_BUDGET=%d is invalid. Only -1 (dynamic) or >0 (token budget) are valid. "
@@ -210,7 +210,6 @@ def create_provider(env: AgentEnv) -> LLMProvider:
         return GeminiProvider(**kwargs)
 
     else:  # openai (default)
-        import logging
         if provider_type != "openai":
             logging.getLogger(__name__).warning(
                 "Unknown LLM_PROVIDER '%s', defaulting to OpenAI. "
