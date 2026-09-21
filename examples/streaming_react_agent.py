@@ -117,7 +117,7 @@ class LoggingHook(Hook):
     async def handle(self, ctx: HookContext) -> HookContext:
         if ctx.event == HookEvent.AFTER_LLM_CALL:
             response = ctx.response
-            if not response:
+            if not response or not response.content:
                 return ctx
 
             # Print thinking blocks
