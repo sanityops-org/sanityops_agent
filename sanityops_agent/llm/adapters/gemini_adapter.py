@@ -51,9 +51,19 @@ class GeminiAdapter(MessageAdapter):
         """Normalize tool call ID to Gemini-compatible format.
 
         Gemini requires IDs matching ^[a-zA-Z0-9_-]{1,64}$
+
+        If truncation occurs, we keep the first 56 chars and append a 7-char hash
+        to reduce collision risk while staying within 64 char limit.
         """
         normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", id)
-        return normalized[:64]
+        if len(normalized) <= 64:
+            return normalized
+        # Truncate and add hash suffix to reduce collision risk
+        import hashlib
+        hash_suffix = hashlib.md5(id.encode()).hexdigest()[:7]
+        result = f"{normalized[:56]}_{hash_suffix}"
+        logger.debug("Tool call ID truncated: %s -> %s", id[:30], result)
+        return result
 
     def _is_same_provider_and_model(
         self, msg: Message, current_provider: str | None, current_model: str | None

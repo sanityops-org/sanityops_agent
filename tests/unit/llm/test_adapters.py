@@ -1199,11 +1199,14 @@ class TestGeminiAdapterToolCallIdNormalization:
         assert normalized == "call_with_pipes"
 
     def test_normalize_truncates_long_id(self, adapter):
-        """IDs longer than 64 chars should be truncated."""
+        """IDs longer than 64 chars should be truncated with hash suffix to avoid collisions."""
         long_id = "a" * 100
         normalized = adapter._normalize_tool_call_id(long_id)
         assert len(normalized) == 64
-        assert normalized == "a" * 64
+        # First 56 chars are 'a', then underscore, then 7-char hash
+        assert normalized[:56] == "a" * 56
+        assert normalized[56] == "_"
+        assert len(normalized[57:]) == 7  # hash suffix
 
     def test_normalize_preserves_valid_id(self, adapter):
         """Valid IDs should pass through unchanged."""

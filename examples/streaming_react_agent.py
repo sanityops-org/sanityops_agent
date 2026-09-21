@@ -84,6 +84,13 @@ class C:
     DIVIDER = "\033[2;90m"   # dim grey
 
 
+# Display limits for readable output
+MAX_THINKING_DISPLAY = 500
+MAX_TOOL_INPUT_DISPLAY = 200
+MAX_TOOL_RESULT_DISPLAY = 300
+MAX_SIGNATURE_DISPLAY = 20
+
+
 def _print_tag(tag: str, colour: str) -> None:
     print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
     print(f"{colour}{C.BOLD}{tag}{C.RESET}")
@@ -117,10 +124,10 @@ class LoggingHook(Hook):
                 if isinstance(block, ThinkingBlock):
                     _print_tag("[THINK]", C.THINK)
                     text = block.thinking
-                    print(f"{C.DIM}{text[:500]}{'...' if len(text) > 500 else ''}{C.RESET}")
+                    print(f"{C.DIM}{text[:MAX_THINKING_DISPLAY]}{'...' if len(text) > MAX_THINKING_DISPLAY else ''}{C.RESET}")
                     # Show signature if present
                     if block.thinking_signature:
-                        print(f"{C.DIM}  [signature: {block.thinking_signature[:20]}...]{C.RESET}")
+                        print(f"{C.DIM}  [signature: {block.thinking_signature[:MAX_SIGNATURE_DISPLAY]}...]{C.RESET}")
 
             # Print text blocks
             for block in response.content:
@@ -129,25 +136,25 @@ class LoggingHook(Hook):
                     print(block.text)
                     # Show signature if present
                     if block.text_signature:
-                        print(f"{C.DIM}  [signature: {block.text_signature[:20]}...]{C.RESET}")
+                        print(f"{C.DIM}  [signature: {block.text_signature[:MAX_SIGNATURE_DISPLAY]}...]{C.RESET}")
 
             # Print tool calls
             tool_calls = [b for b in response.content if isinstance(b, ToolUseBlock)]
             if tool_calls:
                 for tc in tool_calls:
-                    sig_note = f" [sig: {tc.thought_signature[:15]}...]" if tc.thought_signature else ""
+                    sig_note = f" [sig: {tc.thought_signature[:MAX_SIGNATURE_DISPLAY]}...]" if tc.thought_signature else ""
                     print(f"\n{C.ACT}→ Tool: {tc.tool_name}({json.dumps(tc.tool_input)}){sig_note}{C.RESET}")
 
         elif ctx.event == HookEvent.BEFORE_TOOL_EXEC:
             _print_tag(f"[ACT] Calling {ctx.tool_name}", C.ACT)
             if ctx.tool_input:
-                print(f"  Input: {json.dumps(ctx.tool_input)[:200]}")
+                print(f"  Input: {json.dumps(ctx.tool_input)[:MAX_TOOL_INPUT_DISPLAY]}")
 
         elif ctx.event == HookEvent.AFTER_TOOL_EXEC:
             result = str(ctx.result) if ctx.result else ""
             status = "❌" if ctx.is_error else "✓"
             colour = C.ERROR if ctx.is_error else C.OBSERVE
-            print(f"\n{colour}{status} [OBSERVE] {result[:300]}{'...' if len(result) > 300 else ''}{C.RESET}")
+            print(f"\n{colour}{status} [OBSERVE] {result[:MAX_TOOL_RESULT_DISPLAY]}{'...' if len(result) > MAX_TOOL_RESULT_DISPLAY else ''}{C.RESET}")
 
         elif ctx.event == HookEvent.ON_ERROR:
             _print_tag(f"[ERROR] {ctx.error}", C.ERROR)
@@ -182,6 +189,14 @@ def create_provider(env: AgentEnv) -> LLMProvider:
             "store_thinking": env.STORE_THINKING,
         }
         if env.THINKING_BUDGET != 0:
+            # Only -1 should map to None (dynamic budget), warn about other negative values
+            import logging
+            if env.THINKING_BUDGET < -1:
+                logging.getLogger(__name__).warning(
+                    "THINKING_BUDGET=%d is invalid. Only -1 (dynamic) or >0 (token budget) are valid. "
+                    "Defaulting to dynamic budget.",
+                    env.THINKING_BUDGET,
+                )
             # -1 maps to None (dynamic budget), >0 maps to specific token budget
             kwargs["thinking_budget"] = env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
         if env.GOOGLE_CLOUD_PROJECT:
@@ -191,6 +206,13 @@ def create_provider(env: AgentEnv) -> LLMProvider:
         return GeminiProvider(**kwargs)
 
     else:  # openai (default)
+        import logging
+        if provider_type != "openai":
+            logging.getLogger(__name__).warning(
+                "Unknown LLM_PROVIDER '%s', defaulting to OpenAI. "
+                "Valid providers: openai, anthropic, gemini",
+                env.LLM_PROVIDER,
+            )
         from sanityops_agent.llm.providers.openai import OpenAIProvider
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
