@@ -30,6 +30,9 @@ from sanityops_agent.llm.exceptions import (
 logger = logging.getLogger(__name__)
 
 # Gemini model version pattern for feature detection
+# Matches: gemini-2.5-flash -> "2", gemini-live-3-pro -> "3"
+# Note: This pattern expects the standard naming convention "gemini-<major>.<minor>-<variant>"
+# Future models with different conventions (e.g., "gemini-25-pro") would need pattern updates.
 _GEMINI_VERSION_PATTERN = re.compile(r"^gemini(?:-live)?-(\d+)", re.IGNORECASE)
 
 
@@ -159,6 +162,9 @@ class GeminiAdapter(MessageAdapter):
                 elif isinstance(block, ToolResultBlock):
                     # Gemini FunctionResponse requires both id (call ID) and name (function name)
                     # We look up the function name from preceding ToolUseBlock
+                    # ToolResultBlocks are always user-role messages in Gemini's protocol
+                    assert role == "user", "ToolResultBlock must be in user-role message for Gemini"
+
                     fn_name = call_to_name.get(block.tool_call_id, block.tool_call_id)
                     normalized_id = self._normalize_tool_call_id(block.tool_call_id)
                     part = {
