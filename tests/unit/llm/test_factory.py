@@ -189,10 +189,11 @@ class TestProviderFactoryListProviders:
 class TestProviderFactoryGemini:
     @pytest.fixture(autouse=True)
     def _setup_registry(self):
+        # Re-register after module-level _clean_registry clears everything
         from sanityops_agent.llm.providers.gemini import GeminiProvider
         ProviderFactory.register("gemini", GeminiProvider)
         yield
-        ProviderFactory._registry.pop("gemini", None)
+        # Cleanup handled by module-level _clean_registry fixture
 
     def _make_config(self, **kwargs):
         from sanityops_agent.config import ProviderConfig

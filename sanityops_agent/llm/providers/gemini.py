@@ -33,7 +33,7 @@ class GeminiProvider(LLMProvider):
     def __init__(
         self,
         api_key: str,
-        base_url: str | None = None,
+        base_url: str | None = None,  # Not currently used; kept for signature compatibility
         model: str = DEFAULT_MODEL,
         # Vertex AI configuration
         project_id: str | None = None,
