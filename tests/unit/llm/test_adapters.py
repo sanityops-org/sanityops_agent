@@ -790,13 +790,14 @@ class TestGeminiAdapterToolUse:
                 },
                 "finishReason": "STOP",
             }],
-            "model": "gemini-3.5-flash-lite",
+            "modelVersion": "gemini-3.5-flash-lite",
         }
         result = adapter.from_provider_response(response)
 
         assert len(result.content) == 1
         assert isinstance(result.content[0], ToolUseBlock)
         assert result.content[0].tool_name == "search"
+        assert result.model == "gemini-3.5-flash-lite"
         assert result.content[0].tool_input == {"query": "test"}
 
 
