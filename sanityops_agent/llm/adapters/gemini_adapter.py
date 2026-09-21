@@ -29,12 +29,6 @@ from sanityops_agent.llm.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# Gemini model version pattern for feature detection
-# Matches: gemini-2.5-flash -> "2", gemini-live-3-pro -> "3"
-# Note: This pattern expects the standard naming convention "gemini-<major>.<minor>-<variant>"
-# Future models with different conventions (e.g., "gemini-25-pro") would need pattern updates.
-_GEMINI_VERSION_PATTERN = re.compile(r"^gemini(?:-live)?-(\d+)", re.IGNORECASE)
-
 
 class GeminiAdapter(MessageAdapter):
     """Google Gemini API message adapter.

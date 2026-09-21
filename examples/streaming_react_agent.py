@@ -181,6 +181,7 @@ def create_provider(env: AgentEnv) -> LLMProvider:
             "store_thinking": env.STORE_THINKING,
         }
         if env.THINKING_BUDGET != 0:
+            # -1 maps to None (dynamic budget), >0 maps to specific token budget
             kwargs["thinking_budget"] = env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
         if env.GOOGLE_CLOUD_PROJECT:
             kwargs["project_id"] = env.GOOGLE_CLOUD_PROJECT

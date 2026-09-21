@@ -23,6 +23,7 @@ from anthropic import (
     Anthropic,
     APIConnectionError,
     APIStatusError,
+    APITimeoutError,
     RateLimitError,
 )
 
@@ -120,7 +121,7 @@ def run_review(payload: dict, diff: str) -> str:
                 messages=[{"role": "user", "content": user_prompt}],
             )
             break
-        except (RateLimitError, APIConnectionError) as e:
+        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             if attempt == max_attempts:
                 raise
             delay = min(2 ** attempt, 30)
