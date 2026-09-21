@@ -14,6 +14,7 @@ Run inside a GitHub Actions workflow. Requires the following env vars:
 
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -36,7 +37,10 @@ MAX_RETRY_DELAY = 120
 
 
 def extract_retry_after(exception: Exception) -> float | None:
-    """Extract the Retry-After delay (seconds) from an API error, if present."""
+    """Extract the Retry-After delay (seconds) from an API error, if present.
+
+    Supports both delta-seconds (integer) and HTTP-date formats per RFC 7231.
+    """
     headers = getattr(exception, "response", None)
     headers = getattr(headers, "headers", None)
     if not headers:
@@ -44,9 +48,19 @@ def extract_retry_after(exception: Exception) -> float | None:
     value = headers.get("retry-after")
     if value is None:
         return None
+    # Try delta-seconds format first (most common)
     try:
         return max(0.0, float(value))
     except (TypeError, ValueError):
+        pass
+    # Fall back to HTTP-date format (e.g., "Wed, 21 Oct 2026 07:28:00 GMT")
+    try:
+        from email.utils import parsedate_to_datetime
+
+        retry_at = parsedate_to_datetime(value)
+        delay = retry_at.timestamp() - time.time()
+        return max(0.0, delay) if delay > 0 else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -147,9 +161,12 @@ def run_review(payload: dict, diff: str) -> str:
                 # is persistently unavailable. Post a notice instead.
                 post_quota_notice(payload, e, max_attempts)
                 return ""
-            # Respect Retry-After header if present, else exponential backoff
-            delay = extract_retry_after(e) or min(2 ** attempt, MAX_RETRY_DELAY)
-            print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
+            # Respect Retry-After header if present, else exponential backoff with jitter.
+            # Jitter (±25%) avoids thundering herd when many CI jobs retry
+            # simultaneously against the same rate-limited gateway.
+            base_delay = extract_retry_after(e) or min(2 ** attempt, MAX_RETRY_DELAY)
+            delay = base_delay * random.uniform(0.75, 1.25)
+            print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay:.1f}s", file=sys.stderr)
             time.sleep(delay)
         except APIStatusError as e:
             # Only retry on transient 5xx errors (500, 502, 503, 504)
