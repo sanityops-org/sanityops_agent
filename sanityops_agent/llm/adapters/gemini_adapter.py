@@ -60,7 +60,8 @@ class GeminiAdapter(MessageAdapter):
         if len(normalized) <= 64:
             return normalized
         # Truncate and add hash suffix to reduce collision risk
-        hash_suffix = hashlib.md5(tool_call_id.encode()).hexdigest()[:7]
+        # Use SHA-256 (not MD5) to avoid security scanner warnings
+        hash_suffix = hashlib.sha256(tool_call_id.encode()).hexdigest()[:7]
         result = f"{normalized[:56]}_{hash_suffix}"
         logger.debug("Tool call ID truncated: %s -> %s", tool_call_id[:30], result)
         return result
