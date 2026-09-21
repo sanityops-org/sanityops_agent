@@ -5,7 +5,7 @@ and plugin architecture.
 Install via: pip install sanityops_agent
 """
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 # Config
 # Agents
