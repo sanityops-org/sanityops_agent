@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any
@@ -59,7 +60,6 @@ class GeminiAdapter(MessageAdapter):
         if len(normalized) <= 64:
             return normalized
         # Truncate and add hash suffix to reduce collision risk
-        import hashlib
         hash_suffix = hashlib.md5(id.encode()).hexdigest()[:7]
         result = f"{normalized[:56]}_{hash_suffix}"
         logger.debug("Tool call ID truncated: %s -> %s", id[:30], result)
