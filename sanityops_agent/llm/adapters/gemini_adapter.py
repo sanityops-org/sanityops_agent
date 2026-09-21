@@ -53,9 +53,14 @@ class GeminiAdapter(MessageAdapter):
 
         Gemini requires IDs matching ^[a-zA-Z0-9_-]{1,64}$
 
-        If truncation occurs, we keep the first 56 chars and append a 7-char hash
-        to reduce collision risk while staying within 64 char limit.
+        Empty strings get a default placeholder. Long IDs are truncated
+        with a hash suffix to reduce collision risk.
         """
+        # Handle empty/None inputs with a placeholder
+        if not tool_call_id:
+            logger.debug("Empty tool_call_id normalized to 'empty_call'")
+            return "empty_call"
+
         normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_call_id)
         if len(normalized) <= 64:
             return normalized

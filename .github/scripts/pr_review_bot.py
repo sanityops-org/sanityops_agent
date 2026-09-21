@@ -174,8 +174,9 @@ def run_review(payload: dict, diff: str) -> str:
             transient_codes = {500, 502, 503, 504}
             if e.status_code not in transient_codes or attempt == max_attempts:
                 raise
-            delay = min(2 ** attempt, MAX_RETRY_DELAY)
-            print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
+            base_delay = min(2 ** attempt, MAX_RETRY_DELAY)
+            delay = base_delay * random.uniform(0.75, 1.25)
+            print(f"Server error ({e.status_code}), retry {attempt}/{max_attempts} in {delay:.1f}s", file=sys.stderr)
             time.sleep(delay)
 
     # Extract text from response

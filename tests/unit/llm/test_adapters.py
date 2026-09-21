@@ -1286,6 +1286,20 @@ class TestGeminiAdapterToolCallIdNormalization:
         assert normalized == "call_123____"
         assert re.match(r"^[a-zA-Z0-9_-]+$", normalized)
 
+    def test_normalize_empty_string(self, adapter):
+        """Empty string should return a placeholder."""
+        normalized = adapter._normalize_tool_call_id("")
+        assert normalized == "empty_call"
+
+    def test_normalize_whitespace_only(self, adapter):
+        """Whitespace-only string should normalize to underscores then placeholder if empty."""
+        # All spaces become underscores, so not empty after normalization
+        normalized = adapter._normalize_tool_call_id("   ")
+        assert normalized == "___"
+        # Empty after normalization would hit the empty check
+        normalized = adapter._normalize_tool_call_id("")
+        assert normalized == "empty_call"
+
 
 # ====================================================================
 # GeminiAdapter – tool result merging
