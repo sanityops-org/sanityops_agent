@@ -1211,21 +1211,6 @@ class TestGeminiAdapterToolCallIdNormalization:
         normalized = adapter._normalize_tool_call_id(valid_id)
         assert normalized == valid_id
 
-    def test_requires_tool_call_id_gemini_3(self, adapter):
-        """Gemini 3+ should require tool call IDs."""
-        assert adapter._requires_tool_call_id("gemini-3.5-flash") is True
-        assert adapter._requires_tool_call_id("gemini-3-pro") is True
-        assert adapter._requires_tool_call_id("gemini-3.1-pro") is True
-
-    def test_requires_tool_call_id_gemini_2(self, adapter):
-        """Gemini 2.x should not require tool call IDs."""
-        assert adapter._requires_tool_call_id("gemini-2.5-flash") is False
-        assert adapter._requires_tool_call_id("gemini-2.0-pro") is False
-
-    def test_requires_tool_call_id_claude(self, adapter):
-        """Claude models require tool call IDs."""
-        assert adapter._requires_tool_call_id("claude-3-sonnet") is True
-
     def test_tool_use_block_normalizes_id(self, adapter):
         """Tool use blocks should have normalized IDs in output."""
         tool_use = ToolUseBlock(

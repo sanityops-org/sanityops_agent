@@ -50,18 +50,6 @@ class GeminiAdapter(MessageAdapter):
         self.store_thinking = store_thinking
         self.model_id = model_id
 
-    def _requires_tool_call_id(self, model_id: str | None) -> bool:
-        """Check if the model requires explicit tool call IDs.
-
-        Gemini 3+, Claude, and GPT-OSS models require explicit IDs in function calls/responses.
-        """
-        if not model_id:
-            return True  # Default to including IDs for safety
-        match = _GEMINI_VERSION_PATTERN.match(model_id)
-        if match:
-            return int(match.group(1)) >= 3
-        return model_id.startswith("claude-") or model_id.startswith("gpt-oss-")
-
     def _normalize_tool_call_id(self, id: str) -> str:
         """Normalize tool call ID to Gemini-compatible format.
 
