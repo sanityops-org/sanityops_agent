@@ -644,3 +644,360 @@ class TestOpenAIAdapterMapException:
         mod, cls_name = full_name.rsplit(".", 1)
         exc_cls = type(cls_name, (Exception,), {})
         return exc_cls(msg)
+
+
+# ====================================================================
+# GeminiAdapter – text message conversion
+# ====================================================================
+
+
+class TestGeminiAdapterText:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_single_user_text_message(self, adapter):
+        messages = [Message.from_text(Role.USER, "Hello")]
+        result = adapter.to_provider(messages)
+
+        assert "contents" in result
+        assert len(result["contents"]) == 1
+        content = result["contents"][0]
+        assert content["role"] == "user"
+        assert len(content["parts"]) == 1
+        assert content["parts"][0]["text"] == "Hello"
+
+    def test_assistant_role_becomes_model(self, adapter):
+        messages = [Message.from_text(Role.ASSISTANT, "Hi there")]
+        result = adapter.to_provider(messages)
+
+        content = result["contents"][0]
+        assert content["role"] == "model"
+        assert content["parts"][0]["text"] == "Hi there"
+
+    def test_system_message_becomes_system_instruction(self, adapter):
+        messages = [Message.from_text(Role.SYSTEM, "You are helpful")]
+        result = adapter.to_provider(messages)
+
+        assert "systemInstruction" in result
+        assert result["systemInstruction"]["parts"][0]["text"] == "You are helpful"
+        assert result["contents"] == []
+
+    def test_system_plus_user(self, adapter):
+        messages = [
+            Message.from_text(Role.SYSTEM, "Be concise"),
+            Message.from_text(Role.USER, "What is 2+2?"),
+        ]
+        result = adapter.to_provider(messages)
+
+        assert result["systemInstruction"]["parts"][0]["text"] == "Be concise"
+        assert len(result["contents"]) == 1
+        assert result["contents"][0]["role"] == "user"
+
+
+# ====================================================================
+# GeminiAdapter – tool use blocks
+# ====================================================================
+
+
+class TestGeminiAdapterToolUse:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_tool_use_block_conversion(self, adapter):
+        tool_call = ToolUseBlock(
+            tool_call_id="call_abc",
+            tool_name="search",
+            tool_input={"query": "weather"},
+        )
+        msg = Message(role=Role.ASSISTANT, content=[tool_call])
+        result = adapter.to_provider([msg])
+
+        part = result["contents"][0]["parts"][0]
+        assert "functionCall" in part
+        assert part["functionCall"]["name"] == "search"
+        assert part["functionCall"]["args"] == {"query": "weather"}
+
+    def test_tool_result_block_conversion(self, adapter):
+        result_block = ToolResultBlock(
+            tool_call_id="call_abc",
+            tool_result_content="Sunny, 75F",
+            is_error=False,
+        )
+        msg = Message(role=Role.USER, content=[result_block])
+        out = adapter.to_provider([msg])
+
+        part = out["contents"][0]["parts"][0]
+        assert "functionResponse" in part
+        # Unpaired fallback: name falls back to the call id
+        assert part["functionResponse"]["name"] == "call_abc"
+        assert part["functionResponse"]["response"]["result"] == "Sunny, 75F"
+
+    def test_tool_result_uses_function_name_from_prior_tool_use(self, adapter):
+        """The real agent flow sends ToolUse then ToolResult. Gemini's
+        FunctionResponse requires the FUNCTION NAME, not the call id, so the
+        adapter must look it up from the earlier ToolUseBlock."""
+        tool_use = ToolUseBlock(
+            tool_call_id="call_abc",
+            tool_name="search",
+            tool_input={"query": "weather"},
+        )
+        tool_result = ToolResultBlock(
+            tool_call_id="call_abc",
+            tool_result_content="Sunny, 75F",
+        )
+        messages = [
+            Message(role=Role.ASSISTANT, content=[tool_use]),
+            Message(role=Role.USER, content=[tool_result]),
+        ]
+        out = adapter.to_provider(messages)
+
+        call_part = out["contents"][0]["parts"][0]["functionCall"]
+        assert call_part["id"] == "call_abc"
+        assert call_part["name"] == "search"
+
+        resp_part = out["contents"][1]["parts"][0]["functionResponse"]
+        assert resp_part["id"] == "call_abc"
+        assert resp_part["name"] == "search"
+        assert resp_part["response"]["result"] == "Sunny, 75F"
+
+    def test_tools_parameter(self, adapter):
+        tool_def = ToolDefinition(
+            name="search",
+            description="Search the web",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+        messages = [Message.from_text(Role.USER, "Search for cats")]
+        result = adapter.to_provider(messages, tools=[tool_def])
+
+        assert "tools" in result
+        assert "functionDeclarations" in result["tools"][0]
+        assert result["tools"][0]["functionDeclarations"][0]["name"] == "search"
+
+    def test_parse_tool_use_response(self, adapter):
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": {"query": "test"},
+                        }
+                    }]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-3.5-flash-lite",
+        }
+        result = adapter.from_provider_response(response)
+
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], ToolUseBlock)
+        assert result.content[0].tool_name == "search"
+        assert result.model == "gemini-3.5-flash-lite"
+        assert result.content[0].tool_input == {"query": "test"}
+
+
+# ====================================================================
+# GeminiAdapter – from_provider_chunk (streaming)
+# ====================================================================
+
+
+class TestGeminiAdapterStreaming:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter(store_thinking=True)
+
+    def test_text_delta(self, adapter):
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello"}]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.TEXT
+        assert result.delta == "Hello"
+
+    def test_thinking_delta(self, adapter):
+        # Real Gemini thought parts carry BOTH text and thought=True
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Let me think...", "thought": True}]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.THINKING
+        assert result.delta == "Let me think..."
+
+    def test_thinking_not_stored(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        adapter = GeminiAdapter(store_thinking=False)
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "Hmm...", "thought": True},
+                        {"text": "The answer is 42"},
+                    ]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-3.5-flash-lite",
+        }
+        result = adapter.from_provider_response(response)
+
+        # Only text, no thinking block
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+        assert result.content[0].text == "The answer is 42"
+
+    def test_tool_call_delta(self, adapter):
+        chunk = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": {"query": "test"},
+                        }
+                    }]
+                }
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.type == ContentType.TOOL_USE
+        assert result.tool_call_id == "search"
+        assert result.delta["name"] == "search"
+
+    def test_finish_reason(self, adapter):
+        chunk = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": []}
+            }]
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.finish_reason == FinishReason.MAX_TOKENS
+
+
+# ====================================================================
+# GeminiAdapter – map_exception
+# ====================================================================
+
+
+class TestGeminiAdapterMapException:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_authentication_error_401(self, adapter):
+        """401 status code should map to AuthenticationError with recoverable=False."""
+        exc = self._fake_api_error(401, "Unauthorized")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, AuthenticationError)
+        assert mapped.recoverable is False
+
+    def test_authentication_error_403(self, adapter):
+        """403 status code should map to AuthenticationError with recoverable=False."""
+        exc = self._fake_api_error(403, "Permission denied")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, AuthenticationError)
+        assert mapped.recoverable is False
+
+    def test_rate_limit_error(self, adapter):
+        """429 status code should map to RateLimitError with retry_after."""
+        exc = self._fake_api_error(429, "Rate limited", headers={"retry-after": "60"})
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, RateLimitError)
+        assert mapped.recoverable is True
+        # retry_after should be extracted from headers
+
+    def test_api_error_500(self, adapter):
+        """500+ status codes should map to ProviderUnavailableError."""
+        exc = self._fake_api_error(500, "Internal server error")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_api_error_503(self, adapter):
+        """503 status code should map to ProviderUnavailableError."""
+        exc = self._fake_api_error(503, "Service unavailable")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_context_window_exceeded_error(self, adapter):
+        """400 status with 'context' in message should map to ContextWindowExceededError."""
+        exc = self._fake_api_error(400, "Request payload size exceeds the limit: context window exceeded")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_context_window_exceeded_error_token_keyword(self, adapter):
+        """400 status with 'token' in message should map to ContextWindowExceededError."""
+        exc = self._fake_api_error(400, "Token count exceeds the maximum limit")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_llm_error_400_no_context(self, adapter):
+        """400 status without context keywords should map to LLMError."""
+        exc = self._fake_api_error(400, "Invalid request format")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, LLMError)
+        assert not isinstance(mapped, ContextWindowExceededError)
+
+    def test_unknown_sdk_exception_by_name_resource_exhausted(self, adapter):
+        """ResourceExhausted by name should map to RateLimitError."""
+        exc = self._fake_exception("ResourceExhausted", "Resource exhausted")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, RateLimitError)
+        assert mapped.recoverable is True
+
+    def test_unknown_sdk_exception_by_name_service_unavailable(self, adapter):
+        """ServiceUnavailable by name should map to ProviderUnavailableError."""
+        exc = self._fake_exception("ServiceUnavailable", "Service unavailable")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_plain_unrelated_exception(self, adapter):
+        """Plain unrelated exception should map to LLMError."""
+        exc = ValueError("Something went wrong")
+        mapped = adapter.map_exception(exc)
+        assert isinstance(mapped, LLMError)
+
+    @staticmethod
+    def _fake_api_error(code: int, msg: str, headers: dict | None = None) -> Exception:
+        """Create a fake google.genai.errors.APIError-like exception."""
+        # Import the actual errors module to use the real APIError class
+        import httpx
+        from google.genai import errors as genai_errors
+
+        # Create a mock httpx.Response with the given headers
+        mock_response = httpx.Response(
+            status_code=code,
+            headers=headers or {},
+            text=msg,
+        )
+
+        # Create the actual APIError with proper arguments
+        return genai_errors.APIError(
+            code=code,
+            response_json={"error": {"message": msg}},
+            response=mock_response,
+        )
+
+    @staticmethod
+    def _fake_exception(cls_name: str, msg: str) -> Exception:
+        """Create a generic exception with the given class name."""
+        exc_cls = type(cls_name, (Exception,), {})
+        return exc_cls(msg)

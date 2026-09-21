@@ -19,6 +19,12 @@ class ProviderConfig(BaseSettings):
     BASE_URL: str | None = None
     MODEL_ID: str = "claude-sonnet-4-20250514"
 
+    # Gemini-specific fields
+    GEMINI_PROJECT_ID: str | None = None      # Vertex AI project ID
+    GEMINI_LOCATION: str | None = None        # Vertex AI region
+    GEMINI_THINKING_BUDGET: int | None = None # thinking token budget (None=disabled)
+    GEMINI_STORE_THINKING: bool = False       # whether to store thinking in history
+
     # Backward compatibility: LLM_PROVIDER is deprecated, use PROVIDER
     LLM_PROVIDER: str | None = None
 
