@@ -129,7 +129,7 @@ def run_review(payload: dict, diff: str) -> str:
         f"```diff\n{diff}\n```"
     )
 
-    max_attempts = 5
+    max_attempts = 6
     for attempt in range(1, max_attempts + 1):
         try:
             message = client.messages.create(
