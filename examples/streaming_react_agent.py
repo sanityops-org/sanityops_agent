@@ -8,7 +8,8 @@ Features:
 
 Usage:
     cp .env.example .env   # fill in your API key
-    uv run python examples/streaming_react_agent.py "What's 25 * 13?"
+    uv run python examples/streaming_react_agent.py "List files in the current directory"
+    uv run python examples/streaming_react_agent.py "What is the capital of France?"
 """
 from __future__ import annotations
 
@@ -169,6 +170,7 @@ class LoggingHook(Hook):
             reason = ctx.data.get("reason", "unknown") if ctx.data else "unknown"
             print(f"{C.ANSWER}{C.BOLD}[DONE] {reason}{C.RESET}")
 
+        # Unhandled events (e.g., BEFORE_LLM_CALL) pass through unchanged
         return ctx
 
 

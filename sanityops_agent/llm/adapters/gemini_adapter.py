@@ -195,17 +195,9 @@ class GeminiAdapter(MessageAdapter):
                         }
                     }
 
-                    # Merge consecutive function responses into same user turn
-                    # (required for Cloud Code Assist API compatibility)
-                    last_content = contents[-1] if contents else None
-                    if (
-                        last_content
-                        and last_content["role"] == "user"
-                        and any("functionResponse" in p for p in last_content["parts"])
-                    ):
-                        last_content["parts"].append(part)
-                    else:
-                        parts.append(part)
+                    # All ToolResultBlocks within this message naturally go into the same user turn
+                    # (same Message = same turn in our message model)
+                    parts.append(part)
 
             if parts:
                 contents.append({"role": role, "parts": parts})
