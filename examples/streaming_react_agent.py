@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from typing import Any
 
 from pydantic_settings import BaseSettings
 
@@ -97,13 +98,13 @@ class LoggingHook(Hook):
     name = "logging"
     description = "Print colored logs for agent events"
     priority = 0  # Run first
-    events = [
+    events = {
         HookEvent.AFTER_LLM_CALL,
         HookEvent.BEFORE_TOOL_EXEC,
         HookEvent.AFTER_TOOL_EXEC,
         HookEvent.ON_ERROR,
         HookEvent.ON_TERMINATION,
-    ]
+    }
 
     async def handle(self, ctx: HookContext) -> HookContext:
         if ctx.event == HookEvent.AFTER_LLM_CALL:
@@ -167,14 +168,14 @@ def create_provider(env: AgentEnv) -> LLMProvider:
 
     if provider_type == "anthropic":
         from sanityops_agent.llm.providers.anthropic import AnthropicProvider
-        kwargs: dict = {"api_key": env.API_KEY, "model": env.MODEL}
+        kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return AnthropicProvider(**kwargs)
 
     elif provider_type == "gemini":
         from sanityops_agent.llm.providers.gemini import GeminiProvider
-        kwargs: dict = {
+        kwargs: dict[str, Any] = {
             "api_key": env.API_KEY,
             "model": env.MODEL,
             "store_thinking": env.STORE_THINKING,
@@ -189,7 +190,7 @@ def create_provider(env: AgentEnv) -> LLMProvider:
 
     else:  # openai (default)
         from sanityops_agent.llm.providers.openai import OpenAIProvider
-        kwargs: dict = {"api_key": env.API_KEY, "model": env.MODEL}
+        kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return OpenAIProvider(**kwargs)
