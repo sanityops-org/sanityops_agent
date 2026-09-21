@@ -535,3 +535,195 @@ class TestProviderFactoryIntegration:
         provider = ProviderFactory.create(config)
         assert isinstance(provider, OpenAIProvider)
         assert provider.base_url is None
+
+
+# ---------------------------------------------------------------------------
+# GeminiProvider tests
+# ---------------------------------------------------------------------------
+
+class TestGeminiProviderInstantiation:
+    @pytest.fixture
+    def adapter(self):
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+        return GeminiAdapter()
+
+    def test_can_be_instantiated_with_defaults(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="test-key")
+        assert provider.api_key == "test-key"
+        assert provider.model == "gemini-3.5-flash-lite"
+        assert provider.adapter is not None
+
+    def test_can_be_instantiated_with_vertex_ai_config(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(
+            api_key="test-key",
+            project_id="my-project",
+            location="us-central1",
+        )
+        assert provider.project_id == "my-project"
+        assert provider.location == "us-central1"
+
+    def test_thinking_config(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(
+            api_key="test-key",
+            thinking_budget=2048,
+            store_thinking=True,
+        )
+        assert provider.thinking_budget == 2048
+        assert provider.store_thinking is True
+
+
+class _FakeGeminiClient:
+    """Fake google-genai client: ``close()`` on the sync side, ``aclose()``
+    on the ``aio`` side — matching the real SDK's split."""
+
+    def __init__(self):
+        self.sync_closed = False
+        self.async_closed = False
+
+    def close(self):
+        self.sync_closed = True
+
+    @property
+    def aio(self):
+        return self
+
+    async def aclose(self):
+        self.async_closed = True
+
+
+class _RaisingGeminiClient(_FakeGeminiClient):
+    async def aclose(self):
+        raise RuntimeError("transport failed to close")
+
+
+class TestGeminiProviderClose:
+    @pytest.mark.asyncio
+    async def test_close_closes_async_client_and_clears_reference(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        client = _FakeGeminiClient()
+        provider._client = client
+        await provider.close()
+        assert client.async_closed is True
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_is_best_effort_when_aclose_raises(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        provider._client = _RaisingGeminiClient()
+        await provider.close()  # must not raise
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_is_noop_when_no_client(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        provider = GeminiProvider(api_key="k")
+        await provider.close()  # must not raise
+        assert provider._client is None
+
+
+class TestGeminiProviderCreate:
+    @pytest.fixture
+    def provider(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        return GeminiProvider(api_key="test-key")
+
+    @pytest.mark.asyncio
+    async def test_create_returns_llm_response(self, provider):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sanityops_agent.core.message import Role, TextBlock
+
+        # Mock the SDK response with a real dict from model_dump(by_alias=True)
+        mock_response = MagicMock()
+        mock_response.model_dump.return_value = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello, world!"}]
+                },
+                "finishReason": "STOP",
+            }],
+            "modelVersion": "gemini-3.5-flash-lite",
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+        }
+
+        # generate_content is awaited, so it must be an AsyncMock
+        mock_models = MagicMock()
+        mock_models.generate_content = AsyncMock(return_value=mock_response)
+
+        mock_client = MagicMock()
+        mock_client.aio.models = mock_models
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            result = await provider.create(messages)
+
+        assert isinstance(result, LLMResponse)
+        assert result.model == "gemini-3.5-flash-lite"
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+
+
+class TestGeminiProviderStream:
+    @pytest.fixture
+    def provider(self):
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+        return GeminiProvider(api_key="test-key")
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_chunks(self, provider):
+        from unittest.mock import MagicMock, patch
+
+        from sanityops_agent.core.message import Role, TextBlock
+
+        # Mock streaming response chunks
+        class MockChunk:
+            def __init__(self, text):
+                self._text = text
+
+            def model_dump(self, **kwargs):
+                return {
+                    "candidates": [{
+                        "content": {"parts": [{"text": self._text}]}
+                    }]
+                }
+
+        chunks = [MockChunk("Hel"), MockChunk("lo")]
+
+        class MockAsyncStream:
+            def __init__(self, items):
+                self._items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        # generate_content_stream is a coroutine that RETURNS an async iterator,
+        # so the mock must be an async function returning MockAsyncStream.
+        async def fake_stream(**kwargs):
+            return MockAsyncStream(chunks)
+
+        mock_models = MagicMock()
+        mock_models.generate_content_stream = fake_stream
+
+        mock_client = MagicMock()
+        mock_client.aio.models = mock_models
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            results = []
+            async for chunk in provider.stream(messages):
+                results.append(chunk)
+
+        assert len(results) == 2
+        assert results[0].delta == "Hel"
+        assert results[1].delta == "lo"

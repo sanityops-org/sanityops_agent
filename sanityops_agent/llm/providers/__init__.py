@@ -1,4 +1,5 @@
 from sanityops_agent.llm.providers.anthropic import AnthropicProvider
+from sanityops_agent.llm.providers.gemini import GeminiProvider
 from sanityops_agent.llm.providers.openai import OpenAIProvider
 
-__all__ = ["AnthropicProvider", "OpenAIProvider"]
+__all__ = ["AnthropicProvider", "OpenAIProvider", "GeminiProvider"]
