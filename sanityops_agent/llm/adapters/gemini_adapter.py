@@ -72,7 +72,14 @@ class GeminiAdapter(MessageAdapter):
         """Check if a message is from the same provider and model.
 
         Only keep thoughtSignature when provider AND model match exactly.
+        Returns False if any field is None (conservative: drop signature on mismatch).
         """
+        # Conservative: if either field is None, consider it a mismatch
+        # This handles legacy messages without provider/model fields
+        if msg.provider is None or msg.model is None:
+            return False
+        if current_provider is None or current_model is None:
+            return False
         return msg.provider == current_provider and msg.model == current_model
 
     def to_provider(

@@ -1180,6 +1180,51 @@ class TestGeminiAdapterThoughtSignature:
         assert block.tool_name == "search"
         assert block.thought_signature == "toolRespSig=="
 
+    def test_thinking_block_with_none_provider_drops_signature(self, adapter):
+        """If message provider is None, signature should be dropped."""
+        thinking = ThinkingBlock(
+            thinking="Hmm...",
+            thinking_signature="sig==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider=None,  # Legacy message without provider
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model="gemini-2.5-flash",
+        )
+
+        # Should NOT have thoughtSignature (dropped due to None provider)
+        part = result["contents"][0]["parts"][0]
+        assert "thoughtSignature" not in part
+        assert part["text"] == "Hmm..."
+
+    def test_thinking_block_with_none_current_model_drops_signature(self, adapter):
+        """If current_model is None, signature should be dropped."""
+        thinking = ThinkingBlock(
+            thinking="Hmm...",
+            thinking_signature="sig==",
+        )
+        msg = Message(
+            role=Role.ASSISTANT,
+            content=[thinking],
+            provider="google",
+            model="gemini-2.5-flash",
+        )
+        result = adapter.to_provider(
+            [msg],
+            current_provider="google",
+            current_model=None,  # Unknown current model
+        )
+
+        # Should NOT have thoughtSignature (dropped due to None current_model)
+        part = result["contents"][0]["parts"][0]
+        assert "thoughtSignature" not in part
+
 
 # ====================================================================
 # GeminiAdapter – tool call ID normalization
