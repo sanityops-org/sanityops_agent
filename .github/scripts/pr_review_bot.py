@@ -29,6 +29,24 @@ from anthropic import (
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
+# Cap on the exponential backoff delay between retries (seconds)
+MAX_RETRY_DELAY = 60
+
+
+def extract_retry_after(exception: Exception) -> float | None:
+    """Extract the Retry-After delay (seconds) from an API error, if present."""
+    headers = getattr(exception, "response", None)
+    headers = getattr(headers, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
 
 def read_inputs() -> dict:
     """Read required inputs from the environment."""
@@ -124,7 +142,8 @@ def run_review(payload: dict, diff: str) -> str:
         except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             if attempt == max_attempts:
                 raise
-            delay = min(2 ** attempt, 30)
+            # Respect Retry-After header if present, else exponential backoff
+            delay = extract_retry_after(e) or min(2 ** attempt, MAX_RETRY_DELAY)
             print(f"API error ({type(e).__name__}), retry {attempt}/{max_attempts} in {delay}s", file=sys.stderr)
             time.sleep(delay)
         except APIStatusError as e:
