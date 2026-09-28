@@ -115,21 +115,13 @@ class CalculatorTool(Tool):
     }
 
     async def execute(self, expression: str, **kwargs: Any) -> ToolResult:
-        import operator
         allowed = set("0123456789+-*/.()% ")
         if any(c not in allowed for c in expression):
             return ToolResult(content=f"Error: invalid characters in '{expression}'", success=False)
         try:
-            # Safe evaluation using operator module instead of eval()
-            # Supports: +, -, *, /, **, %, ()
-            ops = {
-                '+': operator.add, '-': operator.sub, '*': operator.mul,
-                '/': operator.truediv, '%': operator.mod, '**': operator.pow,
-            }
-            # For simplicity, use ast.literal_eval for numbers and validate operators
-            # This is safer than eval() as it only parses literals
+            # Safe evaluation using AST parsing instead of eval()
+            # Supports: +, -, *, /, **, %, () and numeric literals
             import ast
-            # Tokenize and validate
             tree = ast.parse(expression, mode='eval')
             # Only allow BinOp with allowed operators and numeric literals
             def _eval_node(node):
