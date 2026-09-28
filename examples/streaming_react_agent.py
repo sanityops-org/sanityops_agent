@@ -52,6 +52,7 @@ from sanityops_agent.tools.builtins import (
 )
 from sanityops_agent.tools.context import ToolContext
 from sanityops_agent.tools.registry import ToolRegistry
+from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 
 
 class AgentEnv(BaseSettings):
@@ -291,6 +292,11 @@ class StreamingReActAgent(BaseAgent):
             try:
                 tool_input = json.loads(input_str) if input_str else {}
             except json.JSONDecodeError:
+                # Malformed JSON in tool arguments; log and use empty dict
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Malformed JSON in tool input for %s: %s", name, input_str[:100]
+                )
                 tool_input = {}
             content.append(ToolUseBlock(
                 tool_call_id=buf.get("tool_call_id", f"stream_call_{idx}"),
@@ -357,7 +363,6 @@ class StreamingReActAgent(BaseAgent):
 
             # Anthropic requires tool results to be in user messages with tool_result
             # content blocks. OpenAI requires role='tool'.
-            from sanityops_agent.llm.providers.anthropic import AnthropicProvider
             tool_result_role = Role.USER if isinstance(self.provider, AnthropicProvider) else Role.TOOL
 
             await self.context.add_message(

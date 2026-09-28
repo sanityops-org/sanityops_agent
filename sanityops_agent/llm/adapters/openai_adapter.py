@@ -350,7 +350,7 @@ class OpenAIAdapter(MessageAdapter):
             )
             err.recoverable = True
             return err
-        if exc_type_name in ("APIError", "APIConnectionError", "OverloadedError"):
+        if exc_type_name in ("APIError", "APIConnectionError"):
             return ProviderUnavailableError(str(exception))
         if exc_type_name in ("BadRequestError",):
             # Prefer a structural signal (HTTP 400) alongside the message
