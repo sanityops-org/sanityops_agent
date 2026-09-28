@@ -89,6 +89,10 @@ class C:
     DIVIDER = "\033[2;90m"   # dim grey
 
 
+# Maximum characters to preview in [OBSERVE] output
+MAX_RESULT_PREVIEW = 200
+
+
 def _print_tag(tag: str, colour: str) -> None:
     print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
     print(f"{colour}{C.BOLD}{tag}{C.RESET}")
@@ -111,11 +115,52 @@ class CalculatorTool(Tool):
     }
 
     async def execute(self, expression: str, **kwargs: Any) -> ToolResult:
+        import operator
         allowed = set("0123456789+-*/.()% ")
         if any(c not in allowed for c in expression):
             return ToolResult(content=f"Error: invalid characters in '{expression}'", success=False)
         try:
-            result = eval(expression, {"__builtins__": {}}, {})
+            # Safe evaluation using operator module instead of eval()
+            # Supports: +, -, *, /, **, %, ()
+            ops = {
+                '+': operator.add, '-': operator.sub, '*': operator.mul,
+                '/': operator.truediv, '%': operator.mod, '**': operator.pow,
+            }
+            # For simplicity, use ast.literal_eval for numbers and validate operators
+            # This is safer than eval() as it only parses literals
+            import ast
+            # Tokenize and validate
+            tree = ast.parse(expression, mode='eval')
+            # Only allow BinOp with allowed operators and numeric literals
+            def _eval_node(node):
+                if isinstance(node, ast.Num):
+                    return node.n
+                if isinstance(node, ast.Constant):
+                    if isinstance(node.value, (int, float)):
+                        return node.value
+                    raise ValueError(f"Invalid constant type: {type(node.value)}")
+                if isinstance(node, ast.BinOp):
+                    left = _eval_node(node.left)
+                    right = _eval_node(node.right)
+                    if isinstance(node.op, ast.Add):
+                        return left + right
+                    if isinstance(node.op, ast.Sub):
+                        return left - right
+                    if isinstance(node.op, ast.Mult):
+                        return left * right
+                    if isinstance(node.op, ast.Div):
+                        return left / right
+                    if isinstance(node.op, ast.Mod):
+                        return left % right
+                    if isinstance(node.op, ast.Pow):
+                        return left ** right
+                    raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+                if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+                    return -_eval_node(node.operand)
+                if isinstance(node, ast.Expression):
+                    return _eval_node(node.body)
+                raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+            result = _eval_node(tree)
             return ToolResult(content=str(result))
         except Exception as e:
             return ToolResult(content=f"Error: {e}", success=False)
@@ -316,12 +361,12 @@ class StreamingReActAgent(BaseAgent):
                     result_content = f"Tool error: {e}"
                     is_error = True
 
-            _print_tag(f"[OBSERVE] {result_content[:200]}{'...' if len(result_content) > 200 else ''}", C.OBSERVE)
+            _print_tag(f"[OBSERVE] {result_content[:MAX_RESULT_PREVIEW]}{'...' if len(result_content) > MAX_RESULT_PREVIEW else ''}", C.OBSERVE)
 
             # Anthropic requires tool results to be in user messages with tool_result
             # content blocks. OpenAI requires role='tool'.
-            is_anthropic = type(self.provider).__name__ == "AnthropicProvider"
-            tool_result_role = Role.USER if is_anthropic else Role.TOOL
+            from sanityops_agent.llm.providers.anthropic import AnthropicProvider
+            tool_result_role = Role.USER if isinstance(self.provider, AnthropicProvider) else Role.TOOL
 
             await self.context.add_message(
                 Message(
@@ -367,11 +412,11 @@ async def main():
     registry.register(CalculatorTool())
     registry.register(CurrentTimeTool())
     registry.register(BashTool())
-    registry.register(FileOpsTool()),
-    registry.register(GlobTool()),
-    registry.register(HistoryTool()),
-    registry.register(SkillTool()),
-    registry.register(TodoTool()),
+    registry.register(FileOpsTool())
+    registry.register(GlobTool())
+    registry.register(HistoryTool())
+    registry.register(SkillTool())
+    registry.register(TodoTool())
     registry.register(TaskTool())
 
     # Build config from env
