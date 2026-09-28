@@ -24,6 +24,7 @@ from pydantic_settings import BaseSettings
 
 from sanityops_agent.agents.factory import AgentFactory
 from sanityops_agent.core.agent import (
+    MAX_RETRY_DELAY,
     AgentConfig,
     AgentResult,
     BaseAgent,
@@ -136,8 +137,6 @@ class CalculatorTool(Tool):
             tree = ast.parse(expression, mode='eval')
             # Only allow BinOp with allowed operators and numeric literals
             def _eval_node(node):
-                if isinstance(node, ast.Num):
-                    return node.n
                 if isinstance(node, ast.Constant):
                     if isinstance(node.value, int | float):
                         return node.value
@@ -298,7 +297,8 @@ class StreamingReActAgent(BaseAgent):
                 # Last finish_reason wins; the stream ends with the final value
                 stop_reason = chunk.finish_reason
 
-        print()  # newline after thinking
+        # Close the streamed line (thinking or text) before the next phase prints.
+        print()
 
         # Build content blocks from buffered data
         content: list = []
@@ -314,11 +314,16 @@ class StreamingReActAgent(BaseAgent):
             try:
                 tool_input = json.loads(input_str) if input_str else {}
             except json.JSONDecodeError:
-                # Malformed JSON in tool arguments; log and use empty dict
+                # Malformed JSON in tool arguments. Keep the raw text under a
+                # reserved key so the tool still receives something actionable
+                # and the full payload is visible in logs.
                 logging.getLogger(__name__).warning(
-                    "Malformed JSON in tool input for %s: %s", name, input_str[:100]
+                    "Malformed JSON in tool input for %s (raw: %r); "
+                    "passing as {\"_raw_input\": ...}",
+                    name,
+                    input_str[:200],
                 )
-                tool_input = {}
+                tool_input = {"_raw_input": input_str}
             content.append(ToolUseBlock(
                 tool_call_id=buf.get("tool_call_id", f"stream_call_{idx}"),
                 tool_name=name,
@@ -355,8 +360,8 @@ class StreamingReActAgent(BaseAgent):
         """Prefer the provider's Retry-After, capped; fall back to backoff."""
         retry_after = getattr(e, "retry_after", None)
         if retry_after and retry_after > 0:
-            return min(retry_after, 60.0)
-        return min(2**attempt, 60.0)
+            return float(min(retry_after, MAX_RETRY_DELAY))
+        return float(min(2**attempt, MAX_RETRY_DELAY))
 
     async def _execute_tools(self, tool_calls: list) -> None:
         """Execute tools and log the observations."""

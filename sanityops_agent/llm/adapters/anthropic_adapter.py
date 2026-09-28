@@ -366,6 +366,9 @@ class AnthropicAdapter(MessageAdapter):
                     index=index,
                 )
             if block.type == "thinking":
+                # Block-start marker: the empty delta carries no content, it
+                # only opens the buffer at this index so the thinking_delta
+                # events that follow land in the right one.
                 return StreamChunk(
                     type=ContentType.THINKING,
                     delta="",
