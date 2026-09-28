@@ -41,7 +41,6 @@ from sanityops_agent.core.message import (
     ToolUseBlock,
 )
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
-from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 from sanityops_agent.managers.history import ToolHistoryStore
 from sanityops_agent.managers.skill import SkillManager
 from sanityops_agent.managers.todo import TodoManager
@@ -191,14 +190,18 @@ class CurrentTimeTool(Tool):
 # ---------------------------------------------------------------------------
 def create_provider(env: AgentEnv) -> LLMProvider:
     """Instantiate an LLM provider from environment config."""
+    # Providers are imported lazily so the demo runs with only the SDK it needs.
     if env.LLM_PROVIDER.lower() == "anthropic":
+        from sanityops_agent.llm.providers.anthropic import AnthropicProvider
+
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return AnthropicProvider(**kwargs)
     else:
         from sanityops_agent.llm.providers.openai import OpenAIProvider
-        kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
+
+        kwargs = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return OpenAIProvider(**kwargs)
@@ -243,6 +246,9 @@ class StreamingReActAgent(BaseAgent):
         tool_call_buffers: dict[int, dict[str, Any]] = {}
         stop_reason = FinishReason.END_TURN
         thinking_tag_printed = False
+        # Providers that report usage during streaming (Anthropic, on the final
+        # message_delta) populate this; others leave it None.
+        stream_usage: dict | None = None
 
         # Stream and print in real-time
         async for chunk in self.provider.stream(
@@ -294,7 +300,12 @@ class StreamingReActAgent(BaseAgent):
                     if chunk.tool_call_id:
                         buf["tool_call_id"] = chunk.tool_call_id
 
-            elif chunk.finish_reason:
+            if chunk.usage:
+                # usage may arrive on its own chunk or alongside the finish
+                # reason; keep the latest report.
+                stream_usage = chunk.usage
+
+            if chunk.finish_reason:
                 # Last finish_reason wins; the stream ends with the final value
                 stop_reason = chunk.finish_reason
 
@@ -342,11 +353,22 @@ class StreamingReActAgent(BaseAgent):
                 tool_input=tool_input,
             ))
 
+        # Normalize to total_tokens (the key the agent loop and compaction
+        # accounting read). Anthropic reports input_tokens/output_tokens.
+        usage: dict = {"total_tokens": 0}
+        if stream_usage:
+            total = stream_usage.get("total_tokens")
+            if total is None:
+                total = (stream_usage.get("input_tokens") or 0) + (
+                    stream_usage.get("output_tokens") or 0
+                )
+            usage = {**stream_usage, "total_tokens": total}
+
         return LLMResponse(
             content=content,
             stop_reason=stop_reason,
             model=self.provider.model if hasattr(self.provider, "model") else "unknown",
-            usage={"total_tokens": 0},
+            usage=usage,
         )
 
     async def _call_llm_with_retry(self) -> LLMResponse:
@@ -399,13 +421,13 @@ class StreamingReActAgent(BaseAgent):
 
             _print_tag(f"[OBSERVE] {result_content[:MAX_RESULT_PREVIEW]}{'...' if len(result_content) > MAX_RESULT_PREVIEW else ''}", C.OBSERVE)
 
-            # Anthropic requires tool results to be in user messages with tool_result
-            # content blocks. OpenAI requires role='tool'.
-            tool_result_role = Role.USER if isinstance(self.provider, AnthropicProvider) else Role.TOOL
-
+            # Role.TOOL is the neutral internal representation: the Anthropic
+            # adapter merges it into the following user turn (Role.TOOL and
+            # Role.USER coalesce), OpenAI maps it to role:"tool", and Gemini
+            # treats it as a user message. No provider-specific branch needed.
             await self.context.add_message(
                 Message(
-                    role=tool_result_role,
+                    role=Role.TOOL,
                     content=[
                         ToolResultBlock(
                             tool_call_id=tool_call_id,

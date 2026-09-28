@@ -266,10 +266,15 @@ class AnthropicAdapter(MessageAdapter):
         if event_type == "message_delta":
             delta = raw.get("delta", {})
             stop_reason = delta.get("stop_reason")
-            if stop_reason:
+            # usage arrives on this event alongside the stop reason.
+            usage = raw.get("usage")
+            if stop_reason or usage:
                 return StreamChunk(
                     type=ContentType.TEXT,
-                    finish_reason=self._map_stop_reason(stop_reason),
+                    finish_reason=(
+                        self._map_stop_reason(stop_reason) if stop_reason else None
+                    ),
+                    usage=dict(usage) if usage else None,
                 )
             return None
 
@@ -406,10 +411,21 @@ class AnthropicAdapter(MessageAdapter):
 
         if event_type == "message_delta":
             stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
-            if stop_reason:
+            # usage arrives on this event alongside the stop reason.
+            usage = getattr(event, "usage", None)
+            usage_dict: dict | None = None
+            if usage is not None:
+                try:
+                    usage_dict = dict(usage)
+                except (TypeError, ValueError):
+                    usage_dict = None
+            if stop_reason or usage_dict:
                 return StreamChunk(
                     type=ContentType.TEXT,
-                    finish_reason=self._map_stop_reason(stop_reason),
+                    finish_reason=(
+                        self._map_stop_reason(stop_reason) if stop_reason else None
+                    ),
+                    usage=usage_dict,
                 )
             return None
 

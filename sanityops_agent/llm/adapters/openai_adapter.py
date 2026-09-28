@@ -38,7 +38,8 @@ def _dump_tool_input(tool_name: str, tool_input: dict) -> str:
         return json.dumps(tool_input)
     except (TypeError, ValueError):
         logger.warning(
-            "Tool input for %r is not JSON-serializable; stringifying as raw",
+            "Tool input for %r is not JSON-serializable; wrapping as "
+            '{"raw": <str(input)>}',
             tool_name,
         )
         return json.dumps({"raw": str(tool_input)})

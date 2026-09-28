@@ -286,6 +286,31 @@ class TestAnthropicAdapterStreaming:
         result = adapter.from_provider_chunk(chunk)
 
         assert result.finish_reason == FinishReason.END_TURN
+        assert result.usage is None
+
+    def test_message_delta_with_usage(self, adapter: AnthropicAdapter):
+        """Anthropic reports token usage on the final message_delta event."""
+        chunk = {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 10, "output_tokens": 42},
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.finish_reason == FinishReason.END_TURN
+        assert result.usage == {"input_tokens": 10, "output_tokens": 42}
+
+    def test_message_delta_usage_only(self, adapter: AnthropicAdapter):
+        """A usage report with no stop reason still surfaces the usage."""
+        chunk = {
+            "type": "message_delta",
+            "delta": {},
+            "usage": {"input_tokens": 5, "output_tokens": 7},
+        }
+        result = adapter.from_provider_chunk(chunk)
+
+        assert result.finish_reason is None
+        assert result.usage == {"input_tokens": 5, "output_tokens": 7}
 
 
 # ====================================================================

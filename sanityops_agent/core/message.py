@@ -106,6 +106,9 @@ class StreamChunk:
     tool_call_id: str | None = None
     index: int = 0
     finish_reason: FinishReason | None = None
+    # Token usage, when the provider reports it during streaming (Anthropic
+    # sends it on the final message_delta event). None when unreported.
+    usage: dict | None = None
 
 
 @dataclass
