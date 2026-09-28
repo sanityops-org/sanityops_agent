@@ -31,13 +31,16 @@ from sanityops_agent.llm.exceptions import (
 logger = logging.getLogger(__name__)
 
 
-def _dump_tool_input(tool_input: dict) -> str:
+def _dump_tool_input(tool_name: str, tool_input: dict) -> str:
     """Serialize tool arguments; a non-JSON-serializable input is stringified
     rather than raising mid-conversation."""
     try:
         return json.dumps(tool_input)
     except (TypeError, ValueError):
-        logger.warning("Tool input is not JSON-serializable; stringifying")
+        logger.warning(
+            "Tool input for %r is not JSON-serializable; stringifying as raw",
+            tool_name,
+        )
         return json.dumps({"raw": str(tool_input)})
 
 
@@ -119,7 +122,9 @@ class OpenAIAdapter(MessageAdapter):
                             "type": "function",
                             "function": {
                                 "name": tc.tool_name,
-                                "arguments": _dump_tool_input(tc.tool_input),
+                                "arguments": _dump_tool_input(
+                                    tc.tool_name, tc.tool_input
+                                ),
                             },
                         }
                         for tc in tool_calls

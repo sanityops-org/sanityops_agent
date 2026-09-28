@@ -30,6 +30,7 @@ from sanityops_agent.core.agent import (
     BaseAgent,
 )
 from sanityops_agent.core.message import (
+    ContentBlockUnion,
     ContentType,
     FinishReason,
     Message,
@@ -297,11 +298,22 @@ class StreamingReActAgent(BaseAgent):
                 # Last finish_reason wins; the stream ends with the final value
                 stop_reason = chunk.finish_reason
 
-        # Close the streamed line (thinking or text) before the next phase prints.
-        print()
+            elif chunk.type == ContentType.ERROR:
+                # No built-in adapter currently emits ERROR chunks, but handle
+                # them so a future provider cannot fail silently.
+                error_text = str(chunk.delta or "unknown stream error")
+                logging.getLogger(__name__).error(
+                    "Stream error from provider: %s", error_text
+                )
+                print(f"\n{C.ERROR}[STREAM ERROR] {error_text}{C.RESET}")
+
+        # Close the streamed line, but only if something was streamed — a
+        # tool-only response would otherwise emit a stray blank line.
+        if thinking_tag_printed or text_buffer:
+            print()
 
         # Build content blocks from buffered data
-        content: list = []
+        content: list[ContentBlockUnion] = []
         if thinking_buffer.strip():
             content.append(ThinkingBlock(thinking=thinking_buffer.strip()))
         if text_buffer.strip():

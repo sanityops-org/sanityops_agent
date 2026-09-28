@@ -220,6 +220,19 @@ class StateManager:
             blocks: list[ContentBlockUnion] = []
             for b in raw_blocks:
                 block_type = b.get("type", ContentType.TEXT.value)
+                if block_type in (
+                    ContentType.TOOL_USE.value,
+                    ContentType.TOOL_RESULT.value,
+                ) and not b.get("tool_call_id"):
+                    # tool_call_id is the required linking key for both tool
+                    # block types; a missing or empty one means the file is
+                    # corrupt. Raise the ValueError the load path documents
+                    # instead of a bare KeyError (or a silently unpaired
+                    # block that would break tool_use/tool_result pairing).
+                    raise ValueError(
+                        f"Tool block of type {block_type!r} is missing a "
+                        f"'tool_call_id'; the state file is corrupt"
+                    )
                 if block_type == ContentType.TOOL_USE.value:
                     blocks.append(
                         ToolUseBlock(
