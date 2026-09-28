@@ -117,13 +117,16 @@ class AgentContext:
         point 14). The accumulated usage total never shrinks, so comparing
         against it would re-fire the trigger on every call after compaction.
 
-        The lock serializes concurrent callers. The in-flight flag is a
-        defensive guard for reentrant callers (e.g. a future hook invoked from
-        within ``_do_compact``): re-entering a non-reentrant ``asyncio.Lock``
-        would deadlock, so the flag lets such a call return False instead.
-        Both are checked without an intervening await, so overlapping calls
+        The lock serializes concurrent callers. The in-flight flag is checked
+        BEFORE the lock so a reentrant caller (e.g. a hook invoked from within
+        ``_do_compact``) returns False instead of deadlocking: asyncio.Lock is
+        not reentrant, so such a call would block forever waiting on a lock it
+        already holds. The second check after acquiring is for the ordinary
+        concurrent case. Neither check awaits in between, so overlapping calls
         either compact once or return False — never double-compact.
         """
+        if self._compaction_in_flight:
+            return False
         async with self._compact_lock:
             if self._compaction_in_flight:
                 return False

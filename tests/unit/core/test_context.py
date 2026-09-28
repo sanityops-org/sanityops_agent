@@ -247,6 +247,45 @@ class TestCompactIfNeeded:
         assert ctx.has_compacted is True
 
 
+    @pytest.mark.asyncio
+    async def test_reentrant_compaction_does_not_deadlock(self):
+        """A reentrant call must return False, not deadlock on the lock.
+
+        asyncio.Lock is not reentrant, so the in-flight flag has to be checked
+        before acquiring it. Without that ordering this test hangs (caught by
+        the timeout) rather than failing an assertion.
+        """
+        import asyncio
+
+        config = CompactConfig(trigger_token_threshold=1, preserve_recent_count=0)
+        ctx = AgentContext(compact_config=config)
+        ctx.messages.append(
+            Message(
+                role=Role.ASSISTANT,
+                content=[
+                    ToolResultBlock(tool_call_id="c1", tool_result_content="x" * 100)
+                ],
+            )
+        )
+
+        inner_results: list[bool] = []
+
+        original_do_compact = ctx._do_compact
+
+        async def patched_do_compact():
+            # We are now inside the lock with the flag set; this must not hang.
+            inner_results.append(await ctx.compact_if_needed())
+            await original_do_compact()
+
+        ctx._do_compact = patched_do_compact
+
+        outer = await asyncio.wait_for(ctx.compact_if_needed(), timeout=2.0)
+
+        assert outer is True
+        assert inner_results == [False]
+        assert ctx._compaction_in_flight is False
+
+
 # --- AgentContext._do_compact Tests ---
 
 
