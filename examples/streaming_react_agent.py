@@ -128,7 +128,7 @@ class CalculatorTool(Tool):
                 if isinstance(node, ast.Num):
                     return node.n
                 if isinstance(node, ast.Constant):
-                    if isinstance(node.value, (int, float)):
+                    if isinstance(node.value, int | float):
                         return node.value
                     raise ValueError(f"Invalid constant type: {type(node.value)}")
                 if isinstance(node, ast.BinOp):
