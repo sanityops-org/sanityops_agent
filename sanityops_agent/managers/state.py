@@ -47,6 +47,9 @@ class StateManager:
         }
         tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         payload = json.dumps(data, indent=2)
+        # Create the parent eagerly: os.open would otherwise fail when the
+        # caller passed a path under a directory that does not exist yet.
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         # Create the temp file owner-only from the start: write_text() would
         # briefly create it with umask permissions, exposing conversation
         # content to other users before a later chmod could run.

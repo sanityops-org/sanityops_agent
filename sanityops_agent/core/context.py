@@ -98,6 +98,11 @@ class AgentContext:
         Example: a 20k-character tool result estimates to 5,000 tokens; the
         default threshold (80,000) is crossed at roughly 320k characters of
         English prose, sooner for code-heavy histories.
+
+        Only text-bearing fields are counted (text, thinking,
+        tool_result_content). Tool call names/inputs are ignored, so a history
+        dominated by large structured tool inputs is underestimated and
+        compacts later than the threshold suggests.
         """
         chars = 0
         for msg in self.messages:

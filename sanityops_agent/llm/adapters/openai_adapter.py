@@ -296,6 +296,7 @@ class OpenAIAdapter(MessageAdapter):
                 type=ContentType.TOOL_USE,
                 delta={"name": fn.get("name", ""), "arguments": fn.get("arguments", "")},
                 tool_call_id=tc.get("id"),
+                index=tc.get("index", 0) or 0,
             )
 
         # Thinking/reasoning content (some OpenAI-compatible APIs send it)
@@ -415,16 +416,22 @@ class OpenAIAdapter(MessageAdapter):
         if delta.tool_calls:
             tc = delta.tool_calls[0]
             fn = tc.function
+            # The index identifies which tool call this fragment belongs to, so
+            # a consumer can buffer several parallel calls. tc.index is always
+            # set by the API; fall back to 0 for hand-built chunks.
+            index = tc.index if tc.index is not None else 0
             if fn is not None:
                 return StreamChunk(
                     type=ContentType.TOOL_USE,
                     delta={"name": fn.name or "", "arguments": fn.arguments or ""},
                     tool_call_id=tc.id,
+                    index=index,
                 )
             return StreamChunk(
                 type=ContentType.TOOL_USE,
                 delta={},
                 tool_call_id=tc.id,
+                index=index,
             )
 
         # Thinking/reasoning content

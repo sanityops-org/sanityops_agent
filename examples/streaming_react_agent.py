@@ -157,6 +157,8 @@ class CalculatorTool(Tool):
                         return left % right
                     if isinstance(node.op, ast.Pow):
                         return left ** right
+                    if isinstance(node.op, ast.FloorDiv):
+                        return left // right
                     raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
                 if isinstance(node, ast.UnaryOp):
                     if isinstance(node.op, ast.USub):
@@ -240,13 +242,18 @@ class StreamingReActAgent(BaseAgent):
         # key: tool index -> {name, input_str, tool_call_id}
         tool_call_buffers: dict[int, dict[str, Any]] = {}
         stop_reason = FinishReason.END_TURN
+        thinking_tag_printed = False
 
         # Stream and print in real-time
-        _print_tag("[THINK]", C.THINK)
         async for chunk in self.provider.stream(
             self.context.messages, tools=tool_defs,
         ):
             if chunk.type == ContentType.THINKING and chunk.delta:
+                # Print the tag lazily, on the first thinking chunk, so a
+                # response with no reasoning does not emit an empty [THINK].
+                if not thinking_tag_printed:
+                    _print_tag("[THINK]", C.THINK)
+                    thinking_tag_printed = True
                 thinking_buffer += chunk.delta
                 print(f"{C.DIM}{chunk.delta}{C.RESET}", end="", flush=True)
 
