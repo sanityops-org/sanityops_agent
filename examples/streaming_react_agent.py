@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -33,10 +34,12 @@ from sanityops_agent.core.message import (
     Message,
     Role,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
+from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 from sanityops_agent.managers.history import ToolHistoryStore
 from sanityops_agent.managers.skill import SkillManager
 from sanityops_agent.managers.todo import TodoManager
@@ -52,7 +55,6 @@ from sanityops_agent.tools.builtins import (
 )
 from sanityops_agent.tools.context import ToolContext
 from sanityops_agent.tools.registry import ToolRegistry
-from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 
 
 class AgentEnv(BaseSettings):
@@ -103,10 +105,18 @@ def _print_tag(tag: str, colour: str) -> None:
 # Simple built-in tools for the demo
 # ---------------------------------------------------------------------------
 class CalculatorTool(Tool):
-    """Evaluate a simple arithmetic expression safely."""
+    """Evaluate a simple arithmetic expression safely.
+
+    Note: Only basic arithmetic is supported (+, -, *, /, **, %, ()).
+    Scientific notation (e.g., 1e10) is not supported.
+    """
 
     name = "calculator"
-    description = "Evaluate a math expression. Only supports basic arithmetic (+ - * / ** %)."
+    description = (
+        "Evaluate a math expression. "
+        "Supports: +, -, *, /, ** (power), % (modulo), (). "
+        "No scientific notation."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -282,6 +292,8 @@ class StreamingReActAgent(BaseAgent):
 
         # Build content blocks from buffered data
         content: list = []
+        if thinking_buffer.strip():
+            content.append(ThinkingBlock(thinking=thinking_buffer.strip()))
         if text_buffer.strip():
             content.append(TextBlock(text=text_buffer.strip()))
 
@@ -293,7 +305,6 @@ class StreamingReActAgent(BaseAgent):
                 tool_input = json.loads(input_str) if input_str else {}
             except json.JSONDecodeError:
                 # Malformed JSON in tool arguments; log and use empty dict
-                import logging
                 logging.getLogger(__name__).warning(
                     "Malformed JSON in tool input for %s: %s", name, input_str[:100]
                 )
@@ -311,7 +322,7 @@ class StreamingReActAgent(BaseAgent):
             usage={"total_tokens": 0},
         )
 
-    async def _call_llm_with_retry(self):
+    async def _call_llm_with_retry(self) -> LLMResponse:
         """Agent-level retry with recoverable check and error logging."""
         for attempt in range(self.config.max_retries):
             try:
