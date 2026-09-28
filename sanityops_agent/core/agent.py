@@ -81,7 +81,7 @@ class BaseAgent(ABC):
         if self.context is None:
             self.context = AgentContext(
                 compact_config=CompactConfig(
-                    trigger_token_threshold=self.config.token_budget * 0.8
+                    trigger_token_threshold=int(self.config.token_budget * 0.8)
                 )
             )
             if self.config.system_prompt:

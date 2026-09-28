@@ -6,10 +6,58 @@ from typing import Any
 from sanityops_agent.core.message import (
     FinishReason,
     Message,
+    Role,
     StreamChunk,
     ToolDefinition,
 )
 from sanityops_agent.llm.base import LLMResponse
+
+
+def merge_consecutive_messages(
+    messages: list[Message],
+    merge_roles: frozenset[Role],
+) -> list[Message]:
+    """Drop empty-content messages and collapse adjacent same-role messages.
+
+    The agent loop stores one internal Message per tool result, so a turn with
+    N parallel tool calls produces N consecutive same-role messages. Providers
+    require a specific grouping of those results, so each adapter normalizes
+    the history before emitting its payload.
+
+    - Messages with empty ``content`` are dropped. This removes the bare
+      assistant placeholder that SubAgent appends, which would otherwise emit
+      an invalid empty assistant turn.
+    - Adjacent messages whose role is in ``merge_roles`` are concatenated in
+      order; a role change always starts a new message, so the alternation of
+      the emitted payload is preserved.
+
+    Pure: returns new Message objects with new content lists. The input
+    messages and their block lists are never mutated, and the content blocks
+    are shared by reference (adapters only read them). Idempotent.
+    """
+    out: list[Message] = []
+    for msg in messages:
+        if not msg.content:
+            continue
+        if out and out[-1].role == msg.role and msg.role in merge_roles:
+            out[-1] = Message(
+                role=out[-1].role,
+                content=out[-1].content + list(msg.content),
+                provider=out[-1].provider,
+                model=out[-1].model,
+                raw_response=out[-1].raw_response,
+            )
+        else:
+            out.append(
+                Message(
+                    role=msg.role,
+                    content=list(msg.content),
+                    provider=msg.provider,
+                    model=msg.model,
+                    raw_response=msg.raw_response,
+                )
+            )
+    return out
 
 
 class MessageAdapter(ABC):

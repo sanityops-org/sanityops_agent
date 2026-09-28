@@ -49,7 +49,8 @@ class TestStateManagerSave:
         data = json.loads(open(tmp_state_path).read())
         assert len(data["messages"]) == 1
         assert data["messages"][0]["role"] == "user"
-        assert data["messages"][0]["text"] == "hello world"
+        # New format uses "blocks" instead of "text"
+        assert data["messages"][0]["blocks"][0]["text"] == "hello world"
         assert data["total_tokens"] == 100
 
     @pytest.mark.asyncio

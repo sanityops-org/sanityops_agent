@@ -114,11 +114,22 @@ class TestAnthropicProviderStream:
     async def test_stream_yields_chunks(self):
         provider = AnthropicProvider(api_key="sk-ant")
 
-        from anthropic.lib.streaming import TextEvent
+        # Use simple mock objects matching the raw event structure
+        # The adapter handles content_block_delta events, not parsed convenience events
+        class MockDelta:
+            def __init__(self, delta_type, text):
+                self.type = delta_type
+                self.text = text
+
+        class MockEvent:
+            def __init__(self, event_type, index=0, delta=None):
+                self.type = event_type
+                self.index = index
+                self.delta = delta
 
         events = [
-            TextEvent(type="text", text="Hel", snapshot="Hel"),
-            TextEvent(type="text", text="lo", snapshot="Hello"),
+            MockEvent("content_block_delta", index=0, delta=MockDelta("text_delta", "Hel")),
+            MockEvent("content_block_delta", index=0, delta=MockDelta("text_delta", "lo")),
         ]
 
         class MockStream:

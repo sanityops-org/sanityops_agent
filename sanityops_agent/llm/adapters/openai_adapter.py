@@ -17,7 +17,7 @@ from sanityops_agent.core.message import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from sanityops_agent.llm.adapters.base import MessageAdapter
+from sanityops_agent.llm.adapters.base import MessageAdapter, merge_consecutive_messages
 from sanityops_agent.llm.base import LLMResponse
 from sanityops_agent.llm.exceptions import (
     AuthenticationError,
@@ -31,6 +31,16 @@ from sanityops_agent.llm.exceptions import (
 logger = logging.getLogger(__name__)
 
 
+def _dump_tool_input(tool_input: dict) -> str:
+    """Serialize tool arguments; a non-JSON-serializable input is stringified
+    rather than raising mid-conversation."""
+    try:
+        return json.dumps(tool_input)
+    except (TypeError, ValueError):
+        logger.warning("Tool input is not JSON-serializable; stringifying")
+        return json.dumps({"raw": str(tool_input)})
+
+
 class OpenAIAdapter(MessageAdapter):
     """OpenAI API message adapter.
 
@@ -40,6 +50,12 @@ class OpenAIAdapter(MessageAdapter):
     - assistant messages: {\"role\": \"assistant\", \"content\": \"...\" or [blocks]}
     - tool calls in message: {\"role\": \"assistant\", \"tool_calls\": [{\"id\": \"...\", \"function\": {...}}]}
     - tool results: {\"role\": \"tool\", \"tool_call_id\": \"...\", \"content\": \"...\"}
+
+    Known limitation: a user message with several text blocks is flattened to
+    plain text for compatibility (logged as a warning); tool results in user
+    messages are unaffected, but any other non-text block in a user message is
+    downgraded to its repr. Multi-block user content should be joined by the
+    caller when it matters.
     """
 
     def to_provider(
@@ -49,28 +65,36 @@ class OpenAIAdapter(MessageAdapter):
         **kwargs: Any,
     ) -> dict:
         result: list[dict] = []
+
+        # OpenAI needs an assistant message carrying tool_calls, followed by one
+        # role:"tool" message per call, so the tool-result messages must stay
+        # separate (unlike Anthropic). Merge assistant messages only: that
+        # absorbs the bare assistant placeholder SubAgent appends, which would
+        # otherwise emit an empty assistant turn between tool_calls and results.
+        messages = merge_consecutive_messages(
+            messages,
+            frozenset({Role.ASSISTANT}),
+        )
+
         for msg in messages:
             role = self._map_role(msg.role)
 
             if role == "assistant":
-                # Check if message is only tool results -> emit as tool-role
-                tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-                has_non_tool_result = any(
-                    not isinstance(b, ToolResultBlock) for b in msg.content
-                )
-
-                if tool_results and not has_non_tool_result:
-                    # Emit as tool-role messages
-                    for tr in tool_results:
-                        entry: dict[str, Any] = {
+                # OpenAI requires one role:"tool" message PER tool_call_id,
+                # each answering the assistant message that carries tool_calls.
+                # ToolResultBlocks arriving on an assistant message (the agent
+                # loop stores results as user messages, but other callers may
+                # not) are therefore extracted here, BEFORE the assistant turn
+                # is emitted, so the tool messages always follow it.
+                for tr in (b for b in msg.content if isinstance(b, ToolResultBlock)):
+                    result.append(
+                        {
                             "role": "tool",
                             "tool_call_id": tr.tool_call_id,
                             "content": tr.tool_result_content,
                         }
-                        result.append(entry)
-                    continue
+                    )
 
-                # Normal assistant message
                 texts = [b for b in msg.content if isinstance(b, TextBlock)]
                 tool_calls = [b for b in msg.content if isinstance(b, ToolUseBlock)]
 
@@ -78,7 +102,15 @@ class OpenAIAdapter(MessageAdapter):
                 for t in texts:
                     content_parts.append({"type": "text", "text": t.text})
 
-                entry = {"role": role}
+                # A message with no convertible content must not be emitted as an
+                # assistant turn: {"role":"assistant","content":""} with no
+                # tool_calls sits invalidly between tool_calls and its results.
+                # The tool messages extracted above are already appended, so
+                # skipping the assistant shell loses nothing.
+                if not content_parts and not tool_calls:
+                    continue
+
+                entry: dict[str, Any] = {"role": role}
                 entry["content"] = content_parts if content_parts else None
                 if tool_calls:
                     entry["tool_calls"] = [
@@ -87,13 +119,11 @@ class OpenAIAdapter(MessageAdapter):
                             "type": "function",
                             "function": {
                                 "name": tc.tool_name,
-                                "arguments": json.dumps(tc.tool_input),
+                                "arguments": _dump_tool_input(tc.tool_input),
                             },
                         }
                         for tc in tool_calls
                     ]
-                if not entry.get("content") and not entry.get("tool_calls"):
-                    entry["content"] = ""
                 result.append(entry)
 
             elif role == "tool":
@@ -118,12 +148,14 @@ class OpenAIAdapter(MessageAdapter):
                     if isinstance(block, TextBlock):
                         content_list.append({"type": "text", "text": block.text})
                     elif isinstance(block, ToolUseBlock):
-                        content_list.append({
-                            "type": "tool_call",
-                            "tool_call_id": block.tool_call_id,
-                            "name": block.tool_name,
-                            "input": block.tool_input,
-                        })
+                        content_list.append(
+                            {
+                                "type": "tool_call",
+                                "tool_call_id": block.tool_call_id,
+                                "name": block.tool_name,
+                                "input": block.tool_input,
+                            }
+                        )
                     elif isinstance(block, ToolResultBlock):
                         tool_results.append(block)
                     else:
@@ -133,21 +165,43 @@ class OpenAIAdapter(MessageAdapter):
                 # must be converted to role: "tool" messages
                 if role == "user" and tool_results and not content_list:
                     for tr in tool_results:
-                        result.append({
-                            "role": "tool",
-                            "tool_call_id": tr.tool_call_id,
-                            "content": tr.tool_result_content,
-                        })
+                        result.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tr.tool_call_id,
+                                "content": tr.tool_result_content,
+                            }
+                        )
                     continue
 
                 # System messages: plain string; user messages: array-of-blocks
-                if role == "system" and len(content_list) == 1 and content_list[0]["type"] == "text":
+                if (
+                    role == "system"
+                    and len(content_list) == 1
+                    and content_list[0]["type"] == "text"
+                ):
                     entry["content"] = content_list[0]["text"]
                 else:
                     # OPENAI fix: user messages with multiple blocks
                     # Some versions may not support array format, flatten to text
                     if role == "user" and len(content_list) > 1:
-                        # Flatten to single text for compatibility
+                        # Flatten to single text for compatibility.
+                        #
+                        # Known limitation: text block structure is lost. Text
+                        # blocks survive as joined text; tool results in user
+                        # messages are handled separately (emitted as
+                        # role:"tool") and are NOT affected, but any other
+                        # non-text block in a user message is downgraded to its
+                        # repr. Callers relying on structured multi-part
+                        # content on OpenAI need to join text themselves.
+                        non_text = sum(1 for i in content_list if i["type"] != "text")
+                        logger.warning(
+                            "Flattening user message with %d blocks (%d "
+                            "non-text) to plain text; text block structure is "
+                            'lost (tool results unaffected — emitted as "tool")',
+                            len(content_list),
+                            non_text,
+                        )
                         text_parts = []
                         for item in content_list:
                             if item["type"] == "text":
@@ -173,9 +227,16 @@ class OpenAIAdapter(MessageAdapter):
                     "description": t.description,
                     "parameters": {
                         **(t.input_schema or {}),
-                        "additionalProperties": False,
+                        # A schema may declare additionalProperties itself;
+                        # otherwise strict-mode compatibility defaults it off.
+                        "additionalProperties": (t.input_schema or {}).get(
+                            "additionalProperties",
+                            (t.provider_config or {}).get(
+                                "additionalProperties", False
+                            ),
+                        ),
                     },
-                    "strict": True,
+                    "strict": (t.provider_config or {}).get("strict", True),
                 },
             }
             for t in tools
@@ -233,7 +294,7 @@ class OpenAIAdapter(MessageAdapter):
             fn = tc.get("function", {})
             return StreamChunk(
                 type=ContentType.TOOL_USE,
-                delta=fn,
+                delta={"name": fn.get("name", ""), "arguments": fn.get("arguments", "")},
                 tool_call_id=tc.get("id"),
             )
 
@@ -289,11 +350,18 @@ class OpenAIAdapter(MessageAdapter):
             )
             err.recoverable = True
             return err
-        if exc_type_name in ("APIError", "APIConnectionError"):
+        if exc_type_name in ("APIError", "APIConnectionError", "OverloadedError"):
             return ProviderUnavailableError(str(exception))
         if exc_type_name in ("BadRequestError",):
-            if "context" in msg and ("exceed" in msg or "maximum context" in msg):
-                return ContextWindowExceededError(str(exception))
+            # Prefer a structural signal (HTTP 400) alongside the message
+            # keywords, which providers change freely.
+            status = getattr(getattr(exception, "response", None), "status_code", None)
+            if status is None or status == 400:
+                context_window = (
+                    "context" in msg and ("exceed" in msg or "too_long" in msg)
+                ) or ("maximum context" in msg)
+                if context_window:
+                    return ContextWindowExceededError(str(exception))
         return LLMError(str(exception))
 
     def from_sdk_response(self, response: ChatCompletion) -> LLMResponse:
@@ -309,6 +377,8 @@ class OpenAIAdapter(MessageAdapter):
 
         if message.tool_calls:
             for tc in message.tool_calls:
+                if tc.type != "function":
+                    continue
                 try:
                     arguments = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
@@ -344,15 +414,23 @@ class OpenAIAdapter(MessageAdapter):
         # Tool call delta
         if delta.tool_calls:
             tc = delta.tool_calls[0]
-            fn = tc.function or {}
+            fn = tc.function
+            if fn is not None:
+                return StreamChunk(
+                    type=ContentType.TOOL_USE,
+                    delta={"name": fn.name or "", "arguments": fn.arguments or ""},
+                    tool_call_id=tc.id,
+                )
             return StreamChunk(
                 type=ContentType.TOOL_USE,
-                delta={"name": fn.name, "arguments": fn.arguments} if fn else {},
+                delta={},
                 tool_call_id=tc.id,
             )
 
         # Thinking/reasoning content
-        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+        reasoning = getattr(delta, "reasoning_content", None) or getattr(
+            delta, "reasoning", None
+        )
         if reasoning is not None and reasoning != "":
             return StreamChunk(
                 type=ContentType.THINKING,
