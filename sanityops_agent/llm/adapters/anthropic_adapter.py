@@ -31,7 +31,7 @@ from sanityops_agent.llm.exceptions import (
 logger = logging.getLogger(__name__)
 
 
-def _coalesce(result: list[dict], role: str, blocks: list[dict]) -> None:
+def _coalesce(result: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]) -> None:
     """Append an entry, merging it into the previous one when roles coincide.
 
     Anthropic requires roles to alternate: every tool_result for an assistant
