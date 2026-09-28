@@ -158,8 +158,11 @@ class CalculatorTool(Tool):
                     if isinstance(node.op, ast.Pow):
                         return left ** right
                     raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
-                if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-                    return -_eval_node(node.operand)
+                if isinstance(node, ast.UnaryOp):
+                    if isinstance(node.op, ast.USub):
+                        return -_eval_node(node.operand)
+                    if isinstance(node.op, ast.UAdd):
+                        return _eval_node(node.operand)
                 if isinstance(node, ast.Expression):
                     return _eval_node(node.body)
                 raise ValueError(f"Unsupported expression element: {type(node).__name__}")
@@ -187,7 +190,6 @@ class CurrentTimeTool(Tool):
 def create_provider(env: AgentEnv) -> LLMProvider:
     """Instantiate an LLM provider from environment config."""
     if env.LLM_PROVIDER.lower() == "anthropic":
-        from sanityops_agent.llm.providers.anthropic import AnthropicProvider
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
@@ -286,6 +288,7 @@ class StreamingReActAgent(BaseAgent):
                         buf["tool_call_id"] = chunk.tool_call_id
 
             elif chunk.finish_reason:
+                # Last finish_reason wins; the stream ends with the final value
                 stop_reason = chunk.finish_reason
 
         print()  # newline after thinking

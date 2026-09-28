@@ -5,6 +5,9 @@ from dataclasses import dataclass, field, replace
 
 from sanityops_agent.core.message import Message, ToolResultBlock
 
+# Conservative chars-per-token ratio for token estimation (English prose).
+CHARS_PER_TOKEN_ESTIMATE = 4
+
 
 @dataclass
 class CompactConfig:
@@ -102,17 +105,19 @@ class AgentContext:
                 chars += len(getattr(block, "text", "") or "")
                 chars += len(getattr(block, "thinking", "") or "")
                 chars += len(getattr(block, "tool_result_content", "") or "")
-        return chars // 4
+        return chars // CHARS_PER_TOKEN_ESTIMATE
 
     async def compact_if_needed(self) -> bool:
         """Trigger compaction based on the current token estimate (feedback
         point 14). The accumulated usage total never shrinks, so comparing
         against it would re-fire the trigger on every call after compaction.
 
-        The in-flight flag and lock are checked/acquired without an intervening
-        await, so overlapping calls (public API; callers may drive this from
-        multiple coroutines) either compact once or return False — never
-        double-compact.
+        The lock serializes concurrent callers. The in-flight flag is a
+        defensive guard for reentrant callers (e.g. a future hook invoked from
+        within ``_do_compact``): re-entering a non-reentrant ``asyncio.Lock``
+        would deadlock, so the flag lets such a call return False instead.
+        Both are checked without an intervening await, so overlapping calls
+        either compact once or return False — never double-compact.
         """
         async with self._compact_lock:
             if self._compaction_in_flight:
