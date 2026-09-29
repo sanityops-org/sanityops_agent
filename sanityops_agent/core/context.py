@@ -90,10 +90,13 @@ class AgentContext:
         (chars/4) is what the trigger compares against.
 
         This is deliberately approximate: real tokenizers yield ~3-5 chars per
-        token for English prose, and substantially fewer for code or CJK text.
-        The threshold therefore triggers *earlier* than an exact count would
-        for dense content. Tune ``trigger_token_threshold`` with that in mind;
-        plugging in a provider tokenizer would tighten it if ever needed.
+        token for English prose, and substantially fewer for code, JSON, or CJK
+        text (~1-3). Dense content is therefore UNDERestimated and compaction
+        triggers LATER than the threshold suggests — the conservative failure
+        mode (a late compaction only means a larger context; an early one would
+        truncate history the model still needs). Tune
+        ``trigger_token_threshold`` with that in mind; plugging in a provider
+        tokenizer would tighten it if ever needed.
 
         Example: a 20k-character tool result estimates to 5,000 tokens; the
         default threshold (80,000) is crossed at roughly 320k characters of

@@ -418,6 +418,12 @@ class AnthropicAdapter(MessageAdapter):
                 try:
                     usage_dict = dict(usage)
                 except (TypeError, ValueError):
+                    # Never expected from the SDK; surface it instead of
+                    # silently losing the usage report.
+                    logger.warning(
+                        "Could not convert message_delta usage %r to dict",
+                        usage,
+                    )
                     usage_dict = None
             if stop_reason or usage_dict:
                 return StreamChunk(

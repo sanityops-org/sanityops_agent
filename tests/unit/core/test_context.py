@@ -279,7 +279,9 @@ class TestCompactIfNeeded:
 
         ctx._do_compact = patched_do_compact
 
-        outer = await asyncio.wait_for(ctx.compact_if_needed(), timeout=2.0)
+        # Generous timeout: this test's job is to catch an INDEFINITE deadlock,
+        # not to bound normal operation, so slow CI must not false-positive.
+        outer = await asyncio.wait_for(ctx.compact_if_needed(), timeout=5.0)
 
         assert outer is True
         assert inner_results == [False]
