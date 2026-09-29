@@ -29,7 +29,9 @@ def merge_consecutive_messages(
       an invalid empty assistant turn.
     - Adjacent messages whose role is in ``merge_roles`` are concatenated in
       order; a role change always starts a new message, so the alternation of
-      the emitted payload is preserved.
+      the emitted payload is preserved. ``merge_roles`` is typed as a
+      ``frozenset[Role]`` — pass a literal set and it is coerced by the
+      annotation-checking caller; membership tests on it are O(1).
 
     Pure: returns new Message objects with new content lists. The input
     messages and their block lists are never mutated, and the content blocks

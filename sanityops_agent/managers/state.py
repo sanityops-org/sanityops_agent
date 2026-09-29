@@ -225,10 +225,10 @@ class StateManager:
                     ContentType.TOOL_RESULT.value,
                 ) and not b.get("tool_call_id"):
                     # tool_call_id is the required linking key for both tool
-                    # block types; a missing or empty one means the file is
-                    # corrupt. Raise the ValueError the load path documents
-                    # instead of a bare KeyError (or a silently unpaired
-                    # block that would break tool_use/tool_result pairing).
+                    # block types; `not` rejects both None and "" (an empty
+                    # id would leave the block unpaired). Raise the ValueError
+                    # the load path documents instead of a bare KeyError (or a
+                    # silently unpaired block that would break tool pairing).
                     raise ValueError(
                         f"Tool block of type {block_type!r} is missing a "
                         f"'tool_call_id'; the state file is corrupt"

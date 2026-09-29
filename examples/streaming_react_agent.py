@@ -2,6 +2,8 @@
 Streaming ReAct Agent — reads config from .env, streams LLM output with
 real-time logging of thought process, tool calls, and observations.
 
+Supports OpenAI, Anthropic, and Gemini providers.
+
 Usage:
     cp .env.example .env   # fill in your API key and base_url
     uv run python examples/streaming_react_agent.py "What's 25 * 13?"
@@ -62,10 +64,18 @@ class AgentEnv(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # LLM provider
-    LLM_PROVIDER: str = "openai"  # "openai" | "anthropic"
+    LLM_PROVIDER: str = "openai"  # "openai" | "anthropic" | "gemini"
     API_KEY: str = ""
     BASE_URL: str = ""
     MODEL: str = "gpt-4o-mini"
+
+    # Gemini-specific (Vertex AI)
+    GOOGLE_CLOUD_PROJECT: str = ""
+    GOOGLE_CLOUD_LOCATION: str = ""
+
+    # Thinking configuration (Gemini 2.5+)
+    THINKING_BUDGET: int = 0  # 0 = disabled, -1 = dynamic, >0 = token budget
+    STORE_THINKING: bool = True
 
     # Agent behaviour
     MAX_LOOPS: int = 30
@@ -191,14 +201,47 @@ class CurrentTimeTool(Tool):
 def create_provider(env: AgentEnv) -> LLMProvider:
     """Instantiate an LLM provider from environment config."""
     # Providers are imported lazily so the demo runs with only the SDK it needs.
-    if env.LLM_PROVIDER.lower() == "anthropic":
+    provider_type = env.LLM_PROVIDER.lower()
+    if provider_type == "anthropic":
         from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 
         kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
         if env.BASE_URL:
             kwargs["base_url"] = env.BASE_URL
         return AnthropicProvider(**kwargs)
-    else:
+
+    elif provider_type == "gemini":
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+
+        kwargs = {
+            "api_key": env.API_KEY,
+            "model": env.MODEL,
+            "store_thinking": env.STORE_THINKING,
+        }
+        if env.THINKING_BUDGET != 0:
+            # -1 maps to None (dynamic budget); >0 maps to a token budget.
+            if env.THINKING_BUDGET < -1:
+                logging.getLogger(__name__).warning(
+                    "THINKING_BUDGET=%d is invalid. Only -1 (dynamic) or >0 "
+                    "(token budget) are valid. Defaulting to dynamic budget.",
+                    env.THINKING_BUDGET,
+                )
+            kwargs["thinking_budget"] = (
+                env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
+            )
+        if env.GOOGLE_CLOUD_PROJECT:
+            kwargs["project_id"] = env.GOOGLE_CLOUD_PROJECT
+            if env.GOOGLE_CLOUD_LOCATION:
+                kwargs["location"] = env.GOOGLE_CLOUD_LOCATION
+        return GeminiProvider(**kwargs)
+
+    else:  # openai (default)
+        if provider_type != "openai":
+            logging.getLogger(__name__).warning(
+                "Unknown LLM_PROVIDER '%s', defaulting to OpenAI. "
+                "Valid providers: openai, anthropic, gemini",
+                env.LLM_PROVIDER,
+            )
         from sanityops_agent.llm.providers.openai import OpenAIProvider
 
         kwargs = {"api_key": env.API_KEY, "model": env.MODEL}
