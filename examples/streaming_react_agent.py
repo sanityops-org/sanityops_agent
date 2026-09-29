@@ -6,7 +6,7 @@ Supports OpenAI, Anthropic, and Gemini providers.
 
 Usage:
     cp .env.example .env   # fill in your API key and base_url
-    uv run python examples/streaming_react_agent.py "What's 25 * 13?"
+    uv run python examples/streaming_react_agent.py "What is 25 * 13?"
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from sanityops_agent.core.agent import (
 from sanityops_agent.core.message import (
     ContentBlockUnion,
     ContentType,
+    ErrorBlock,
     FinishReason,
     Message,
     Role,
@@ -123,7 +124,9 @@ class CalculatorTool(Tool):
     """Evaluate a simple arithmetic expression safely.
 
     Note: Only basic arithmetic is supported (+, -, *, /, **, %, ()).
-    Scientific notation (e.g., 1e10) is not supported.
+    Scientific notation (e.g., 1e10) is not supported. Extremely deep
+    nesting (>~900 paren levels) is rejected by Python's recursion limit;
+    the generic RecursionError is caught and returned as a failed result.
     """
 
     name = "calculator"
@@ -294,7 +297,10 @@ class StreamingReActAgent(BaseAgent):
         thinking_tag_printed = False
         # Providers that report usage during streaming (Anthropic, on the final
         # message_delta) populate this; others leave it None.
-        stream_usage: dict | None = None
+        stream_usage: dict[str, Any] | None = None
+        # Text of any ERROR chunks seen, surfaced as ErrorBlocks in the
+        # returned LLMResponse so consumers can detect stream failures.
+        stream_errors: list[str] = []
 
         # Stream and print in real-time
         async for chunk in self.provider.stream(
@@ -363,6 +369,7 @@ class StreamingReActAgent(BaseAgent):
                     "Stream error from provider: %s", error_text
                 )
                 print(f"\n{C.ERROR}[STREAM ERROR] {error_text}{C.RESET}")
+                stream_errors.append(error_text)
 
         # Close the streamed line, but only if something was streamed — a
         # tool-only response would otherwise emit a stray blank line.
@@ -375,6 +382,10 @@ class StreamingReActAgent(BaseAgent):
             content.append(ThinkingBlock(thinking=thinking_buffer.strip()))
         if text_buffer.strip():
             content.append(TextBlock(text=text_buffer.strip()))
+        # Carry stream errors into the response as ErrorBlocks so callers can
+        # detect a partial/failed stream programmatically, not just visually.
+        for error_text in stream_errors:
+            content.append(ErrorBlock(error_code="stream_error", error_message=error_text))
 
         for idx in sorted(tool_call_buffers.keys()):
             buf = tool_call_buffers[idx]
