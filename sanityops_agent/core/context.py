@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from sanityops_agent.core.message import Message, ToolResultBlock
 
 # Conservative chars-per-token ratio for token estimation (English prose).
-CHARS_PER_TOKEN_ESTIMATE = 4
+CHARS_PER_TOKEN_ESTIMATE: int = 4
 
 
 @dataclass

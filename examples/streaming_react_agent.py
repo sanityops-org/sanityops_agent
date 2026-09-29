@@ -106,6 +106,10 @@ class C:
 # Maximum characters to preview in [OBSERVE] output
 MAX_RESULT_PREVIEW = 200
 
+# Characters permitted inside a calculator expression (module-level so the
+# set is not rebuilt on every tool call).
+CALCULATOR_ALLOWED_CHARS = frozenset("0123456789+-*/.()% ")
+
 
 def _print_tag(tag: str, colour: str) -> None:
     print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
@@ -137,8 +141,7 @@ class CalculatorTool(Tool):
     }
 
     async def execute(self, expression: str, **kwargs: Any) -> ToolResult:
-        allowed = set("0123456789+-*/.()% ")
-        if any(c not in allowed for c in expression):
+        if any(c not in CALCULATOR_ALLOWED_CHARS for c in expression):
             return ToolResult(content=f"Error: invalid characters in '{expression}'", success=False)
         try:
             # Safe evaluation using AST parsing instead of eval()
