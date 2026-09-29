@@ -107,10 +107,12 @@ class OpenAIAdapter(MessageAdapter):
                     content_parts.append({"type": "text", "text": t.text})
 
                 # A message with no convertible content must not be emitted as an
-                # assistant turn: {"role":"assistant","content":""} with no
-                # tool_calls sits invalidly between tool_calls and its results.
-                # The tool messages extracted above are already appended, so
-                # skipping the assistant shell loses nothing.
+                # assistant turn: {"role":"assistant","content":""} (or null)
+                # with no tool_calls is an invalid shell between the assistant
+                # turn carrying tool_calls and the tool results answering them
+                # — the API rejects that sequence. The tool messages extracted
+                # above are already appended, so skipping the shell loses
+                # nothing.
                 if not content_parts and not tool_calls:
                     continue
 

@@ -54,6 +54,9 @@ class AgentContext:
     # Compaction serialization. asyncio.Lock() has been loop-independent at
     # construction since Python 3.10 and this package requires >=3.11, so
     # creating it here cannot fail outside an event loop.
+    # Caveat: lock objects are shared if an AgentContext is copied via
+    # dataclasses.replace() (the field default is reused). Do not replace()
+    # an AgentContext; mutate it in place (the agent loop does).
     _compact_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, repr=False, compare=False
     )
