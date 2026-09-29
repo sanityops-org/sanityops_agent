@@ -49,7 +49,8 @@ class TestStateManagerSave:
         data = json.loads(open(tmp_state_path).read())
         assert len(data["messages"]) == 1
         assert data["messages"][0]["role"] == "user"
-        assert data["messages"][0]["text"] == "hello world"
+        # New format uses "blocks" instead of "text"
+        assert data["messages"][0]["blocks"][0]["text"] == "hello world"
         assert data["total_tokens"] == 100
 
     @pytest.mark.asyncio
@@ -133,6 +134,26 @@ class TestStateManagerLoad:
         loaded = await manager.load()
         assert loaded.messages == []
         assert loaded.total_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_load_corrupt_tool_block_raises_value_error(self, tmp_state_path):
+        """A tool block without tool_call_id is corrupt: ValueError, not KeyError."""
+        manager = StateManager(state_path=tmp_state_path)
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "blocks": [{"type": "tool_use", "tool_name": "x"}],
+                }
+            ],
+            "total_tokens": 0,
+            "has_compacted": False,
+            "last_summary": "",
+        }
+        open(tmp_state_path, "w").write(json.dumps(data))
+
+        with pytest.raises(ValueError, match="missing a 'tool_call_id'"):
+            await manager.load()
 
 
 class TestStateManagerRoundTrip:
