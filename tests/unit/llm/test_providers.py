@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import aclosing
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -19,6 +20,28 @@ def _make_httpx_response(status_code: int, json_body: dict | None = None) -> htt
         status_code=status_code,
         json=json_body or {},
         request=httpx.Request("POST", "https://example.com"),
+    )
+
+
+def _make_chat_completion(text: str = "Hello, world!"):
+    """Create a minimal ChatCompletion for OpenAI SDK create() mocks."""
+    from openai.types.chat import ChatCompletion, ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice
+    from openai.types.completion_usage import CompletionUsage
+
+    return ChatCompletion(
+        id="chatcmpl-test",
+        created=1,
+        model="gpt-4o",
+        object="chat.completion",
+        choices=[
+            Choice(
+                finish_reason="stop",
+                index=0,
+                message=ChatCompletionMessage(role="assistant", content=text),
+            )
+        ],
+        usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
     )
 
 
@@ -106,6 +129,153 @@ class TestAnthropicProviderCreate:
             with pytest.raises(AuthenticationError):
                 await provider.create(messages)
 
+    @pytest.mark.asyncio
+    async def test_create_uses_default_max_tokens(self):
+        provider = AnthropicProvider(api_key="sk-ant")
+        assert provider.extra_body is None
+
+        passed_kwargs: dict = {}
+
+        async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            mock_msg = MagicMock()
+            mock_msg.model = "claude-sonnet-4-20250514"
+            mock_msg.stop_reason = "end_turn"
+            mock_msg.content = []
+            mock_msg.usage = None
+            mock_msg.model_dump.return_value = {}
+            return mock_msg
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            await provider.create(messages)
+
+        assert "extra_body" not in passed_kwargs
+        assert passed_kwargs["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
+        assert passed_kwargs["max_tokens"] == 32768
+
+    @pytest.mark.asyncio
+    async def test_create_respects_init_and_call_max_tokens(self):
+        provider = AnthropicProvider(api_key="sk-ant", max_tokens=16384)
+        captured: list[dict] = []
+
+        async def fake_create(**kwargs):
+            captured.append(kwargs)
+            mock_msg = MagicMock()
+            mock_msg.model = "claude-sonnet-4-20250514"
+            mock_msg.stop_reason = "end_turn"
+            mock_msg.content = []
+            mock_msg.usage = None
+            mock_msg.model_dump.return_value = {}
+            return mock_msg
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            await provider.create(messages)
+            await provider.create(messages, max_tokens=4096)
+            await provider.create(messages, max_tokens=None)
+
+        assert [c["max_tokens"] for c in captured] == [16384, 4096, 16384]
+
+    @pytest.mark.asyncio
+    async def test_create_forwards_extra_body_as_deep_copy(self):
+        extra = {"thinking": {"type": "disabled"}}
+        provider = AnthropicProvider(api_key="sk-ant", extra_body=extra)
+
+        passed_kwargs: dict = {}
+
+        async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            passed_kwargs["extra_body"]["thinking"]["type"] = "mutated"
+            mock_msg = MagicMock()
+            mock_msg.model = "claude-sonnet-4-20250514"
+            mock_msg.stop_reason = "end_turn"
+            mock_msg.content = []
+            mock_msg.usage = None
+            mock_msg.model_dump.return_value = {}
+            return mock_msg
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            await provider.create(messages)
+
+        assert "thinking" not in passed_kwargs
+        assert provider.extra_body == {"thinking": {"type": "disabled"}}
+
+    @pytest.mark.asyncio
+    async def test_create_call_override_extra_body(self):
+        provider = AnthropicProvider(
+            api_key="sk-ant", extra_body={"thinking": {"type": "disabled"}}
+        )
+
+        passed_kwargs: dict = {}
+
+        async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            mock_msg = MagicMock()
+            mock_msg.model = "claude-sonnet-4-20250514"
+            mock_msg.stop_reason = "end_turn"
+            mock_msg.content = []
+            mock_msg.usage = None
+            mock_msg.model_dump.return_value = {}
+            return mock_msg
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            await provider.create(messages, extra_body=None)
+
+        assert "extra_body" not in passed_kwargs
+
+    @pytest.mark.asyncio
+    async def test_create_raises_llm_error_without_retry_on_bad_request(self):
+        import anthropic
+
+        from sanityops_agent.llm.exceptions import LLMError
+
+        provider = AnthropicProvider(
+            api_key="sk-ant", extra_body={"thinking": {"type": "disabled"}}
+        )
+        resp = _make_httpx_response(400, {"error": {"message": "unsupported thinking"}})
+        err = anthropic.BadRequestError(
+            message="unsupported thinking", response=resp, body={}
+        )
+        calls = 0
+
+        async def fake_create(**kwargs):
+            nonlocal calls
+            calls += 1
+            raise err
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            with pytest.raises(LLMError, match="unsupported thinking"):
+                await provider.create(messages)
+
+        assert calls == 1
+
 
 class TestAnthropicProviderStream:
     """Tests for AnthropicProvider.stream()."""
@@ -160,6 +330,8 @@ class TestAnthropicProviderStream:
         assert len(chunks) == 2
         assert chunks[0].delta == "Hel"
         assert chunks[1].delta == "lo"
+        stream_kwargs = mock_client.messages.stream.call_args.kwargs
+        assert stream_kwargs["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -256,52 +428,17 @@ class TestOpenAIProviderCreate:
             with pytest.raises(AuthenticationError):
                 await provider.create(messages)
 
-
-class TestOpenAIProviderStream:
-    """Tests for OpenAIProvider.stream()."""
-
     @pytest.mark.asyncio
-    async def test_stream_yields_chunks(self):
+    async def test_create_no_extra_body_by_default(self):
         provider = OpenAIProvider(api_key="sk-123")
+        assert provider.extra_body is None
 
-        from openai.types.chat import ChatCompletionChunk
-        from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
-
-        def make_chunk(content=None, finish_reason=None):
-            delta = ChoiceDelta(content=content)
-            choice = Choice(delta=delta, index=0, finish_reason=finish_reason)
-            chunk = ChatCompletionChunk(
-                id="chunk-test",
-                created=1,
-                model="gpt-4o",
-                object="chat.completion.chunk",
-                choices=[choice],
-            )
-            return chunk
+        passed_kwargs: dict = {}
 
         async def fake_create(**kwargs):
-            chunks = [
-                make_chunk(content="Hel"),
-                make_chunk(content="lo"),
-            ]
-
-            class AsyncIter:
-                def __init__(self, items):
-                    self._items = iter(items)
-
-                def __aiter__(self):
-                    return self
-
-                async def __anext__(self):
-                    try:
-                        return next(self._items)
-                    except StopIteration:
-                        raise StopAsyncIteration
-
-            stream = AsyncIter(chunks)
-            # Mimic AsyncStream.response for close() in cleanup
-            stream.response = MagicMock()
-            return stream
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            return _make_chat_completion()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create = fake_create
@@ -309,13 +446,208 @@ class TestOpenAIProviderStream:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            chunks = []
-            async for chunk in provider.stream(messages):
-                chunks.append(chunk)
+            await provider.create(messages)
+
+        assert "extra_body" not in passed_kwargs
+        assert "max_tokens" not in passed_kwargs
+
+    @pytest.mark.asyncio
+    async def test_create_forwards_extra_body(self):
+        provider = OpenAIProvider(
+            api_key="sk-123", extra_body={"thinking": {"type": "disabled"}}
+        )
+
+        passed_kwargs: dict = {}
+
+        async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            passed_kwargs["extra_body"]["thinking"]["type"] = "mutated"
+            return _make_chat_completion()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            await provider.create(messages)
+
+        assert "extra_body" in passed_kwargs
+        # Mutating the per-call copy must not touch the provider default.
+        assert provider.extra_body == {"thinking": {"type": "disabled"}}
+
+    @pytest.mark.asyncio
+    async def test_create_call_override_extra_body(self):
+        provider = OpenAIProvider(api_key="sk-123", extra_body={"custom": 1})
+
+        passed_kwargs: dict = {}
+
+        async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
+            return _make_chat_completion()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            await provider.create(
+                messages, extra_body={"thinking": {"type": "disabled"}}
+            )
+
+        assert passed_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    @pytest.mark.asyncio
+    async def test_create_raises_llm_error_without_retry_on_bad_request(self):
+        import openai
+
+        from sanityops_agent.llm.exceptions import LLMError
+
+        provider = OpenAIProvider(
+            api_key="sk-123", extra_body={"thinking": {"type": "disabled"}}
+        )
+        resp = _make_httpx_response(400, {"error": {"message": "bad extra_body"}})
+        err = openai.BadRequestError(message="bad extra_body", response=resp, body=None)
+        calls = 0
+
+        async def fake_create(**kwargs):
+            nonlocal calls
+            calls += 1
+            raise err
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            with pytest.raises(LLMError, match="bad extra_body"):
+                await provider.create(messages)
+
+        assert calls == 1
+
+
+class _FakeAsyncOpenAIStream:
+    """Minimal AsyncStream test double tracking context-manager cleanup."""
+
+    def __init__(self, items, error_after: int | None = None):
+        self._items = iter(items)
+        self._error_after = error_after
+        self._yielded = 0
+        self.entered = False
+        self.closed = False
+        self.response = MagicMock()
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.closed = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._error_after is not None and self._yielded >= self._error_after:
+            raise RuntimeError("stream interrupted")
+        try:
+            item = next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration
+        self._yielded += 1
+        return item
+
+
+class TestOpenAIProviderStream:
+    """Tests for OpenAIProvider.stream()."""
+
+    @staticmethod
+    def _make_chunk(content: str | None = None, finish_reason: str | None = None):
+        from openai.types.chat import ChatCompletionChunk
+        from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
+
+        delta = ChoiceDelta(content=content)
+        choice = Choice(delta=delta, index=0, finish_reason=finish_reason)
+        return ChatCompletionChunk(
+            id="chunk-test",
+            created=1,
+            model="gpt-4o",
+            object="chat.completion.chunk",
+            choices=[choice],
+        )
+
+    @staticmethod
+    def _make_provider_with_stream(
+        fake_stream: _FakeAsyncOpenAIStream,
+    ) -> OpenAIProvider:
+        provider = OpenAIProvider(api_key="sk-123")
+
+        async def fake_create(**kwargs):
+            return fake_stream
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = fake_create
+        mock_client.is_closed.return_value = False
+        provider._client = mock_client
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_chunks(self):
+        fake_stream = _FakeAsyncOpenAIStream(
+            [self._make_chunk(content="Hel"), self._make_chunk(content="lo")]
+        )
+        provider = self._make_provider_with_stream(fake_stream)
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+
+        chunks = []
+        async for chunk in provider.stream(messages):
+            chunks.append(chunk)
 
         assert len(chunks) == 2
         assert chunks[0].delta == "Hel"
         assert chunks[1].delta == "lo"
+        assert fake_stream.entered is True
+        assert fake_stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_closes_on_exception(self):
+        fake_stream = _FakeAsyncOpenAIStream(
+            [self._make_chunk(content="Hel"), self._make_chunk(content="lo")],
+            error_after=1,
+        )
+        provider = self._make_provider_with_stream(fake_stream)
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+
+        chunks = []
+        with pytest.raises(RuntimeError, match="stream interrupted"):
+            async for chunk in provider.stream(messages):
+                chunks.append(chunk)
+
+        assert len(chunks) == 1
+        assert fake_stream.entered is True
+        assert fake_stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_closes_on_early_aclose(self):
+        fake_stream = _FakeAsyncOpenAIStream(
+            [self._make_chunk(content="Hel"), self._make_chunk(content="lo")]
+        )
+        provider = self._make_provider_with_stream(fake_stream)
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+
+        chunks = []
+        async with aclosing(provider.stream(messages)) as stream:
+            async for chunk in stream:
+                chunks.append(chunk)
+                break
+
+        assert len(chunks) == 1
+        assert fake_stream.entered is True
+        assert fake_stream.closed is True
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +1009,30 @@ class TestGeminiProviderCreate:
         assert result.model == "gemini-3.5-flash-lite"
         assert len(result.content) == 1
         assert isinstance(result.content[0], TextBlock)
+
+    @pytest.mark.asyncio
+    async def test_create_maps_max_tokens_to_max_output_tokens(self, provider):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sanityops_agent.core.message import Role, TextBlock
+
+        mock_response = MagicMock()
+        mock_response.model_dump.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+            "modelVersion": "gemini-3.5-flash-lite",
+        }
+
+        mock_models = MagicMock()
+        mock_models.generate_content = AsyncMock(return_value=mock_response)
+        mock_client = MagicMock()
+        mock_client.aio.models = mock_models
+
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            await provider.create(messages, max_tokens=4096)
+
+        config = mock_models.generate_content.call_args.kwargs["config"]
+        assert config.max_output_tokens == 4096
 
 
 class TestGeminiProviderStream:

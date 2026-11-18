@@ -175,8 +175,9 @@ Supported environment variables:
 | `API_KEY` | *(required)* | Your API key |
 | `BASE_URL` | *(empty)* | Custom endpoint (vLLM, Azure, etc.) |
 | `MODEL` | `gpt-4o-mini` | Model name |
+| `EXTRA_BODY` | *(empty)* | JSON object forwarded to the provider SDK request (Anthropic/OpenAI) |
 | `MAX_LOOPS` | `30` | Max agent loops per run |
-| `MAX_TOKENS` | `8000` | Max tokens per LLM call |
+| `MAX_TOKENS` | *(provider default)* | Max tokens per LLM call; unset uses the provider default (Anthropic: 32768) |
 | `TOTAL_TIMEOUT` | `300` | Total timeout in seconds |
 | `TEMPERATURE` | `0.7` | Sampling temperature |
 | `SYSTEM_PROMPT` | *(see .env)* | System prompt for the agent |

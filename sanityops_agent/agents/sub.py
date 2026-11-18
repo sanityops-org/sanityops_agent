@@ -138,6 +138,7 @@ class SubAgent(BaseAgent):
         response: LLMResponse = await self.provider.create(
             messages=self.context.messages,
             tools=tool_defs if tool_defs else None,
+            **self._llm_call_kwargs(),
         )
 
         # AFTER_LLM_CALL hook

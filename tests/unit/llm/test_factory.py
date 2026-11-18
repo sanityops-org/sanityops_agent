@@ -230,3 +230,52 @@ class TestProviderFactoryGemini:
     def test_factory_lists_gemini_provider(self):
         providers = ProviderFactory.list_providers()
         assert "gemini" in providers
+
+
+class ExtraBodyAwareDummyProvider(DummyProvider):
+    """Provider whose constructor accepts an extra_body default."""
+
+    def __init__(
+        self,
+        api_key: str = "",
+        base_url: str | None = None,
+        model: str = "dummy",
+        extra_body: dict | None = None,
+    ):
+        super().__init__(api_key, base_url, model)
+        self.extra_body = extra_body
+
+
+class TestProviderFactoryExtraBodySupport:
+    """Tests for ProviderConfig EXTRA_BODY and its forwarding to providers."""
+
+    def test_provider_config_exposes_extra_body(self):
+        assert "EXTRA_BODY" in ProviderConfig.model_fields
+        assert ProviderConfig().EXTRA_BODY is None
+
+    def test_create_passes_extra_body_to_aware_provider(self):
+        ProviderFactory.register("extra_body_dummy", ExtraBodyAwareDummyProvider)
+        config = ProviderConfig(
+            PROVIDER="extra_body_dummy",
+            EXTRA_BODY={"custom": 123},
+        )
+        provider = ProviderFactory.create(config)
+        assert isinstance(provider, ExtraBodyAwareDummyProvider)
+        assert provider.extra_body == {"custom": 123}
+
+    def test_create_default_extra_body_is_none(self):
+        ProviderFactory.register("extra_body_dummy", ExtraBodyAwareDummyProvider)
+        config = ProviderConfig(PROVIDER="extra_body_dummy")
+        provider = ProviderFactory.create(config)
+        assert isinstance(provider, ExtraBodyAwareDummyProvider)
+        assert provider.extra_body is None
+
+    def test_create_ignores_extra_body_for_unaware_provider(self):
+        ProviderFactory.register("plain_dummy", DummyProvider)
+        config = ProviderConfig(
+            PROVIDER="plain_dummy",
+            EXTRA_BODY={"custom": 123},
+        )
+        provider = ProviderFactory.create(config)
+        assert isinstance(provider, DummyProvider)
+        assert not hasattr(provider, "extra_body")

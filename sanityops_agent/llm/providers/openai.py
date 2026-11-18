@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from typing import cast
 
 import httpx
 from openai import (
@@ -12,6 +13,7 @@ from openai import (
 )
 from openai import (
     AsyncOpenAI,
+    AsyncStream,
     BadRequestError,
 )
 from openai import (
@@ -20,6 +22,7 @@ from openai import (
 from openai import (
     RateLimitError as OpenAIRateLimit,
 )
+from openai.types.chat import ChatCompletionChunk
 
 from sanityops_agent.core.message import (
     Message,
@@ -27,7 +30,7 @@ from sanityops_agent.core.message import (
     ToolDefinition,
 )
 from sanityops_agent.llm.adapters.openai_adapter import OpenAIAdapter
-from sanityops_agent.llm.base import LLMProvider, LLMResponse
+from sanityops_agent.llm.base import LLMProvider, LLMResponse, prepare_request_kwargs
 from sanityops_agent.llm.exceptions import (
     APIConnectionError,
     AuthenticationError,
@@ -60,13 +63,18 @@ class OpenAIProvider(LLMProvider):
         base_url: str | None = None,
         model: str = "gpt-4o",
         timeout: float = 120.0,
+        extra_body: dict | None = None,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.extra_body = extra_body
         self._client: AsyncOpenAI | None = None
         self.adapter = OpenAIAdapter()
+
+    def _build_request_kwargs(self, kwargs: dict) -> dict:
+        return prepare_request_kwargs(kwargs, self.extra_body)
 
     def _get_client(self) -> AsyncOpenAI:
         # A closed client is replaced with a fresh one; it is already closed
@@ -101,13 +109,14 @@ class OpenAIProvider(LLMProvider):
     ) -> LLMResponse:
         client = self._get_client()
         payload = self.adapter.to_provider(messages, tools)
+        request_kwargs = self._build_request_kwargs(kwargs)
 
         try:
             completion = await client.chat.completions.create(
                 model=self.model,
                 messages=payload["messages"],
-                tools=payload.get("tools"),
-                **kwargs,
+                tools=payload.get("tools"),  # type: ignore[arg-type]
+                **request_kwargs,
             )
             return self.adapter.from_sdk_response(completion)
 
@@ -119,6 +128,7 @@ class OpenAIProvider(LLMProvider):
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):
                 raise ContextWindowExceededError(str(e))
+            logger.warning("OpenAI call failed with BadRequestError: %s", e)
             raise LLMError(str(e))
         except OpenAIAPIConnectionError as e:
             raise APIConnectionError(str(e))
@@ -135,19 +145,23 @@ class OpenAIProvider(LLMProvider):
     ) -> AsyncIterator[StreamChunk]:
         client = self._get_client()
         payload = self.adapter.to_provider(messages, tools)
+        request_kwargs = self._build_request_kwargs(kwargs)
 
         try:
             stream = await client.chat.completions.create(
                 model=self.model,
                 messages=payload["messages"],
-                tools=payload.get("tools"),
+                tools=payload.get("tools"),  # type: ignore[arg-type]
                 stream=True,
-                **kwargs,
+                **request_kwargs,
             )
-            async for chunk in stream:
-                sc = self.adapter.from_sdk_stream_event(chunk)
-                if sc:
-                    yield sc
+            # With stream=True, the return type is AsyncStream[ChatCompletionChunk]
+            # mypy sees a union; we use a cast to narrow the type
+            async with cast(AsyncStream[ChatCompletionChunk], stream) as stream_iter:
+                async for chunk in stream_iter:
+                    sc = self.adapter.from_sdk_stream_event(chunk)
+                    if sc:
+                        yield sc
 
         except OpenAIAuthError as e:
             raise AuthenticationError(str(e))
@@ -157,6 +171,7 @@ class OpenAIProvider(LLMProvider):
             msg = str(e).lower()
             if "context" in msg and ("exceed" in msg or "maximum" in msg or "too_long" in msg):
                 raise ContextWindowExceededError(str(e))
+            logger.warning("OpenAI stream failed with BadRequestError: %s", e)
             raise LLMError(str(e))
         except OpenAIAPIConnectionError as e:
             raise APIConnectionError(str(e))

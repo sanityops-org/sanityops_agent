@@ -93,7 +93,7 @@ class ParentAgent(BaseAgent):
         )
 
         response = await self.provider.create(
-            self.context.messages, tools=tool_defs
+            self.context.messages, tools=tool_defs, **self._llm_call_kwargs()
         )
 
         # Track token usage

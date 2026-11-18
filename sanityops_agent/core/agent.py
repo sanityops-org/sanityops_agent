@@ -6,11 +6,19 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from sanityops_agent.core.context import AgentContext, CompactConfig
-from sanityops_agent.core.message import FinishReason, Message, Role
+from sanityops_agent.core.message import (
+    FinishReason,
+    Message,
+    Role,
+    TextBlock,
+    ThinkingBlock,
+)
 
 MAX_RETRY_DELAY = 60.0  # Cap on retry backoff / Retry-After (seconds)
+DEFAULT_MAX_EMPTY_RESPONSES = 3
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +45,13 @@ class AgentError:
 @dataclass
 class AgentConfig:
     max_loops: int = 30
-    max_tokens: int = 8000
+    max_tokens: int | None = None
     system_prompt: str = ""  # Converted to Message at startup
 
     # Termination control
     total_timeout: int = 300
     token_budget: int = 100000
+    max_empty_responses: int = DEFAULT_MAX_EMPTY_RESPONSES
 
     # Tool permissions
     allowed_tool_tags: list[str] = field(default_factory=list)
@@ -94,6 +103,9 @@ class BaseAgent(ABC):
             Message.from_text(Role.USER, initial_input)
         )
 
+        max_empty = max(1, self.config.max_empty_responses)
+        consecutive_empty = 0
+
         # 2. Main loop
         for iteration in range(self.config.max_loops):
             # Termination check at start of each iteration (feedback point 13)
@@ -105,12 +117,66 @@ class BaseAgent(ABC):
             try:
                 response = await self._call_llm_with_retry()
             except Exception as e:
-                self._record_error("llm_error", str(e), iteration, recoverable=False)
-                return self._build_result(TerminationReason.ERROR, iteration, str(e))
+                return self._fail(str(e), iteration)
+
+            stop_reason = response.stop_reason
+            stop_label = (
+                stop_reason.value
+                if isinstance(stop_reason, FinishReason)
+                else str(stop_reason)
+            )
+
+            # Reject empty / thinking-only responses before mutating context
+            if self._is_empty_response(response):
+                if stop_reason == FinishReason.MAX_TOKENS:
+                    return self._fail(
+                        "LLM response was truncated by max_tokens before producing "
+                        "any text or tool calls.",
+                        iteration,
+                    )
+                if stop_reason in (FinishReason.CONTENT_FILTER, FinishReason.ERROR):
+                    return self._fail(
+                        f"LLM returned an empty response with stop_reason={stop_label}.",
+                        iteration,
+                    )
+
+                consecutive_empty += 1
+                msg = (
+                    f"LLM returned an empty response ({consecutive_empty}/{max_empty}, "
+                    f"stop_reason={stop_label})."
+                )
+                logger.warning(msg)
+                if consecutive_empty >= max_empty:
+                    return self._fail(msg, iteration)
+                self._record_error("llm_error", msg, iteration, recoverable=True)
+                continue
+
+            consecutive_empty = 0
+
+            # Fail closed on abnormal / truncated stop reasons; skip saving unpaired
+            # tool_use blocks when truncated so multi-turn context stays valid.
+            if stop_reason in (
+                FinishReason.MAX_TOKENS,
+                FinishReason.CONTENT_FILTER,
+                FinishReason.ERROR,
+            ):
+                if not response.has_tool_calls:
+                    await self.context.add_message(
+                        Message(
+                            role=Role.ASSISTANT,
+                            content=response.content,
+                            provider=response.provider,
+                            model=response.model,
+                        )
+                    )
+                err_msg = (
+                    "LLM response was truncated by max_tokens."
+                    if stop_reason == FinishReason.MAX_TOKENS
+                    else f"LLM terminated abnormally with stop_reason={stop_label}."
+                )
+                return self._fail(err_msg, iteration)
 
             # Add LLM response to context as assistant message
-            if not response.content and not response.has_tool_calls:
-                continue
             await self.context.add_message(
                 Message(
                     role=Role.ASSISTANT,
@@ -122,7 +188,11 @@ class BaseAgent(ABC):
 
             # Termination check after LLM returns (feedback point 13)
             # Only terminate if there are no pending tool calls to execute
-            if not response.has_tool_calls and response.stop_reason in [FinishReason.END_TURN, FinishReason.STOP]:
+            if not response.has_tool_calls and stop_reason in (
+                FinishReason.END_TURN,
+                FinishReason.STOP,
+                FinishReason.STOP_SEQUENCE,
+            ):
                 return self._build_result(TerminationReason.END_TURN, iteration)
 
             # Execute tools (if any)
@@ -132,6 +202,31 @@ class BaseAgent(ABC):
                 await self.context.compact_if_needed()
 
         return self._build_result(TerminationReason.MAX_LOOPS, self.config.max_loops - 1)
+
+    @staticmethod
+    def _is_empty_response(response: Any) -> bool:
+        """Return True when response has neither tool calls nor non-blank text."""
+        if response.has_tool_calls:
+            return False
+        content = response.content or []
+        if not content:
+            return True
+        return all(
+            isinstance(block, ThinkingBlock)
+            or (isinstance(block, TextBlock) and not block.text.strip())
+            for block in content
+        )
+
+    def _fail(self, message: str, iteration: int) -> AgentResult:
+        """Record a terminal LLM error and build an ERROR AgentResult."""
+        self._record_error("llm_error", message, iteration, recoverable=False)
+        return self._build_result(TerminationReason.ERROR, iteration, message)
+
+    def _llm_call_kwargs(self) -> dict[str, Any]:
+        """Build optional provider kwargs derived from AgentConfig."""
+        if self.config.max_tokens is not None:
+            return {"max_tokens": self.config.max_tokens}
+        return {}
 
     async def _check_termination_conditions(self, iteration: int) -> TerminationReason | None:
         """Check at start of each iteration (feedback point 13)"""

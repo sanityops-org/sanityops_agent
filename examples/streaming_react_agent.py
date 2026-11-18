@@ -80,7 +80,7 @@ class AgentEnv(BaseSettings):
 
     # Agent behaviour
     MAX_LOOPS: int = 30
-    MAX_TOKENS: int = 8000
+    MAX_TOKENS: int | None = None
     TOTAL_TIMEOUT: int = 300
     TEMPERATURE: float = 0.7
     SYSTEM_PROMPT: str = (
@@ -304,7 +304,7 @@ class StreamingReActAgent(BaseAgent):
 
         # Stream and print in real-time
         async for chunk in self.provider.stream(
-            self.context.messages, tools=tool_defs,
+            self.context.messages, tools=tool_defs, **self._llm_call_kwargs()
         ):
             if chunk.type == ContentType.THINKING and chunk.delta:
                 # Print the tag lazily, on the first thinking chunk, so a

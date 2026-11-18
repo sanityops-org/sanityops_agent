@@ -114,3 +114,31 @@ class TestAgentLoop:
         result = await agent.run("Do two things")
         assert result.termination_reason == TerminationReason.END_TURN
         assert tool.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_max_tokens_does_not_spin_parent_agent(self):
+        """Gateway empty response with MAX_TOKENS must fail fast, not exhaust max_loops."""
+        provider = MockLLMProvider()
+        provider.set_responses(
+            [
+                MockResponseConfig(
+                    content=[],
+                    stop_reason=FinishReason.MAX_TOKENS,
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                )
+            ]
+            * 5
+        )
+        factory = AgentFactory(
+            provider=provider,
+            config=AgentConfig(max_loops=10),
+            tool_registry=ToolRegistry(),
+        )
+        agent = factory.create_parent_agent(system_prompt="You are helpful.")
+
+        result = await agent.run("Large input")
+        assert result.termination_reason == TerminationReason.ERROR
+        assert result.loops_used == 1
+        assert provider.call_count == 1
+        assert result.error_detail
+        assert "max_tokens" in result.error_detail[0].message

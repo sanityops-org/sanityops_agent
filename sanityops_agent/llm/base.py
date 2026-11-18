@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 from sanityops_agent.core.message import (
     ContentBlockUnion,
@@ -58,3 +60,16 @@ class LLMResponse:
     @property
     def has_tool_calls(self) -> bool:
         return len(self.get_tool_calls()) > 0
+
+
+def prepare_request_kwargs(
+    kwargs: dict[str, Any], default_extra_body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Copy per-call kwargs and inject provider default extra_body when omitted."""
+    request_kwargs = dict(kwargs)
+    if "extra_body" not in request_kwargs:
+        if default_extra_body:
+            request_kwargs["extra_body"] = copy.deepcopy(default_extra_body)
+    elif not request_kwargs["extra_body"]:
+        request_kwargs.pop("extra_body", None)
+    return request_kwargs
