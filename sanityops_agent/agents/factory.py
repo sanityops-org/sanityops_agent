@@ -153,6 +153,8 @@ class AgentFactory:
             "max_loops": 10,
             "total_timeout": 120,
             "system_prompt": system_prompt,
+            "max_tokens": self.config.max_tokens,
+            "max_empty_responses": self.config.max_empty_responses,
         }
         # Apply user overrides (can override the defaults above)
         for k, v in overrides.items():

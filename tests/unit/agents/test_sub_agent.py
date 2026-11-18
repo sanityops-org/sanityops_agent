@@ -222,6 +222,27 @@ class TestSubAgentCallLLM:
         call_kwargs = mock_provider.create.call_args
         # tools kwarg should have been passed
         assert "tools" in call_kwargs.kwargs
+        assert "max_tokens" not in call_kwargs.kwargs
+
+    @pytest.mark.asyncio
+    async def test_call_llm_forwards_max_tokens_when_configured(self):
+        mock_provider = AsyncMock(spec=LLMProvider)
+        mock_provider.create.return_value = LLMResponse(
+            content=[TextBlock(text="ok")],
+            stop_reason=FinishReason.END_TURN,
+            model="test-model",
+        )
+        agent = SubAgent(
+            config=AgentConfig(max_tokens=16384),
+            provider=mock_provider,
+            tool_registry=ToolRegistry(),
+        )
+        agent.context = MagicMock()
+        agent.context.messages = []
+
+        await agent._call_llm()
+        call_kwargs = mock_provider.create.call_args
+        assert call_kwargs.kwargs["max_tokens"] == 16384
 
 
 # ---------------------------------------------------------------------------

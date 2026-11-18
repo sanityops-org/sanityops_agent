@@ -59,7 +59,9 @@ class DummyProvider(LLMProvider):
         self.call_history = []
 
     async def create(self, messages, tools=None, **kwargs):
-        self.call_history.append({"messages": messages, "tools": tools})
+        self.call_history.append(
+            {"messages": messages, "tools": tools, "kwargs": kwargs}
+        )
         return LLMResponse(
             content=[TextBlock(text="hi")],
             stop_reason=FinishReason.END_TURN,
@@ -205,6 +207,25 @@ class TestCallLLM:
 
         assert isinstance(response, LLMResponse)
         assert response.stop_reason == FinishReason.END_TURN
+
+    @pytest.mark.asyncio
+    async def test_forwards_max_tokens_only_when_configured(self):
+        provider_default = DummyProvider()
+        agent_default = _make_agent(provider=provider_default)
+        agent_default.context = MagicMock()
+        agent_default.context.messages = []
+        await agent_default._call_llm()
+        assert "max_tokens" not in provider_default.call_history[0]["kwargs"]
+
+        provider_explicit = DummyProvider()
+        agent_explicit = _make_agent(
+            provider=provider_explicit,
+            config=AgentConfig(max_tokens=16384),
+        )
+        agent_explicit.context = MagicMock()
+        agent_explicit.context.messages = []
+        await agent_explicit._call_llm()
+        assert provider_explicit.call_history[0]["kwargs"]["max_tokens"] == 16384
 
 
 # ---------------------------------------------------------------------------

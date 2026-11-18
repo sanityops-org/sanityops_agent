@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import inspect
+from typing import Any
+
 from sanityops_agent.config import ProviderConfig
 from sanityops_agent.llm.base import LLMProvider
 from sanityops_agent.llm.providers.anthropic import AnthropicProvider
@@ -27,23 +30,31 @@ class ProviderFactory:
             raise ValueError(f"Unknown provider '{config.PROVIDER}'. Available: {available}")
 
         provider_cls = cls._registry[provider_name]
+        sig = inspect.signature(provider_cls.__init__)
+        params = sig.parameters
+        kwargs: dict[str, Any] = {
+            "api_key": config.API_KEY,
+            "base_url": config.BASE_URL,
+            "model": config.MODEL_ID,
+        }
 
         if provider_name == "gemini":
-            return provider_cls(
-                api_key=config.API_KEY,
-                base_url=config.BASE_URL,
-                model=config.MODEL_ID,
-                project_id=config.GEMINI_PROJECT_ID,
-                location=config.GEMINI_LOCATION,
-                thinking_budget=config.GEMINI_THINKING_BUDGET,
-                store_thinking=config.GEMINI_STORE_THINKING,
+            kwargs.update(
+                {
+                    "project_id": config.GEMINI_PROJECT_ID,
+                    "location": config.GEMINI_LOCATION,
+                    "thinking_budget": config.GEMINI_THINKING_BUDGET,
+                    "store_thinking": config.GEMINI_STORE_THINKING,
+                }
             )
-        else:
-            return provider_cls(
-                api_key=config.API_KEY,
-                base_url=config.BASE_URL,
-                model=config.MODEL_ID,
-            )
+
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if "extra_body" in params or has_var_keyword:
+            kwargs["extra_body"] = config.EXTRA_BODY
+
+        return provider_cls(**kwargs)
 
     @classmethod
     def list_providers(cls) -> list[str]:

@@ -18,6 +18,7 @@ class ProviderConfig(BaseSettings):
     API_KEY: str = ""
     BASE_URL: str | None = None
     MODEL_ID: str = "claude-sonnet-4-20250514"
+    EXTRA_BODY: dict | None = None
 
     # Gemini-specific fields
     GEMINI_PROJECT_ID: str | None = None      # Vertex AI project ID
@@ -53,7 +54,7 @@ class AgentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENT_", env_file=".env", extra="ignore")
 
     MAX_LOOPS: int = 30
-    MAX_TOKENS: int = 8000
+    MAX_TOKENS: int | None = None
     TOTAL_TIMEOUT: int = 300
     TOKEN_BUDGET: int = 100000
     MAX_RETRIES: int = 3

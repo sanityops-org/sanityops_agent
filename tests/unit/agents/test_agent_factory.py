@@ -186,6 +186,20 @@ class TestCreateSubAgent:
         agent = factory.create_sub_agent()
         assert agent.tool_registry is not factory.tool_registry
 
+    def test_sub_agent_inherits_max_tokens_and_max_empty_responses(self):
+        factory = AgentFactory(
+            provider=_make_provider(),
+            config=AgentConfig(max_tokens=16384, max_empty_responses=2),
+            tool_registry=_make_registry(),
+        )
+        agent = factory.create_sub_agent()
+        assert agent.config.max_tokens == 16384
+        assert agent.config.max_empty_responses == 2
+
+        overridden = factory.create_sub_agent(max_tokens=4096, max_empty_responses=5)
+        assert overridden.config.max_tokens == 4096
+        assert overridden.config.max_empty_responses == 5
+
 
 # ---------------------------------------------------------------------------
 # Skill injection tests

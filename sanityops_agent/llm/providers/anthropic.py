@@ -27,7 +27,7 @@ from sanityops_agent.core.message import (
     ToolDefinition,
 )
 from sanityops_agent.llm.adapters.anthropic_adapter import AnthropicAdapter
-from sanityops_agent.llm.base import LLMProvider, LLMResponse
+from sanityops_agent.llm.base import LLMProvider, LLMResponse, prepare_request_kwargs
 from sanityops_agent.llm.exceptions import (
     APIConnectionError,
     AuthenticationError,
@@ -53,6 +53,7 @@ class AnthropicProvider(LLMProvider):
     """
 
     DEFAULT_BASE_URL = "https://api.anthropic.com"
+    DEFAULT_MAX_TOKENS = 32768
 
     def __init__(
         self,
@@ -61,14 +62,47 @@ class AnthropicProvider(LLMProvider):
         model: str = "claude-sonnet-4-20250514",
         api_version: str = "2023-06-01",
         timeout: float = 120.0,
+        extra_body: dict | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.api_version = api_version
         self.timeout = timeout
+        self.extra_body = extra_body
+        self.max_tokens = max_tokens
         self._client: AsyncAnthropic | None = None
         self.adapter = AnthropicAdapter()
+
+    def _build_request_kwargs(self, kwargs: dict) -> dict:
+        return prepare_request_kwargs(kwargs, self.extra_body)
+
+    def _build_request_body(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        kwargs: dict,
+    ) -> dict:
+        payload = self.adapter.to_provider(messages, tools)
+        request_kwargs = self._build_request_kwargs(kwargs)
+        max_tokens = request_kwargs.pop("max_tokens", None)
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+
+        body: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": payload.get("messages", []),
+        }
+        if "system" in payload:
+            body["system"] = payload["system"]
+        if "tools" in payload:
+            body["tools"] = payload["tools"]
+            body.setdefault("tool_choice", {"type": "auto"})
+
+        body.update(request_kwargs)
+        return body
 
     def _get_client(self) -> AsyncAnthropic:
         # Replace a closed client with a fresh one; a closed client is already
@@ -103,20 +137,7 @@ class AnthropicProvider(LLMProvider):
         **kwargs,
     ) -> LLMResponse:
         client = self._get_client()
-        payload = self.adapter.to_provider(messages, tools)
-
-        body: dict = {
-            "model": self.model,
-            "max_tokens": kwargs.pop("max_tokens", 8192),
-            "messages": payload.get("messages", []),
-        }
-        if "system" in payload:
-            body["system"] = payload["system"]
-        if "tools" in payload:
-            body["tools"] = payload["tools"]
-            body.setdefault("tool_choice", {"type": "auto"})
-
-        body.update(kwargs)
+        body = self._build_request_body(messages, tools, kwargs)
 
         try:
             message = await client.messages.create(**body)
@@ -130,6 +151,7 @@ class AnthropicProvider(LLMProvider):
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:
                 raise ContextWindowExceededError(str(e))
+            logger.warning("Anthropic request failed with BadRequestError: %s", e)
             raise LLMError(str(e))
         except AnthropicAPIConnectionError as e:
             raise APIConnectionError(str(e))
@@ -145,20 +167,7 @@ class AnthropicProvider(LLMProvider):
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
         client = self._get_client()
-        payload = self.adapter.to_provider(messages, tools)
-
-        body: dict = {
-            "model": self.model,
-            "max_tokens": kwargs.pop("max_tokens", 8192),
-            "messages": payload.get("messages", []),
-        }
-        if "system" in payload:
-            body["system"] = payload["system"]
-        if "tools" in payload:
-            body["tools"] = payload["tools"]
-            body.setdefault("tool_choice", {"type": "auto"})
-
-        body.update(kwargs)
+        body = self._build_request_body(messages, tools, kwargs)
 
         try:
             async with client.messages.stream(**body) as stream:
@@ -175,6 +184,7 @@ class AnthropicProvider(LLMProvider):
             msg = str(e).lower()
             if "context" in msg or "too_long" in msg:
                 raise ContextWindowExceededError(str(e))
+            logger.warning("Anthropic stream failed with BadRequestError: %s", e)
             raise LLMError(str(e))
         except AnthropicAPIConnectionError as e:
             raise APIConnectionError(str(e))

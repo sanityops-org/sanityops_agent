@@ -96,6 +96,12 @@ class GeminiProvider(LLMProvider):
 
         # Caller-supplied overrides (temperature, max_output_tokens, ...)
         config_kwargs.update(kwargs)
+        # AgentConfig forwards a provider-agnostic max_tokens; the Gemini SDK
+        # names the same limit max_output_tokens. An explicit
+        # max_output_tokens wins when both are supplied.
+        max_tokens = config_kwargs.pop("max_tokens", None)
+        if max_tokens is not None:
+            config_kwargs.setdefault("max_output_tokens", max_tokens)
 
         return types.GenerateContentConfig(**config_kwargs)
 
