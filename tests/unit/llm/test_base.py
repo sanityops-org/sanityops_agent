@@ -13,6 +13,7 @@ from sanityops_agent.llm.base import LLMProvider, LLMResponse
 # LLMProvider is abstract — cannot be instantiated directly
 # ---------------------------------------------------------------------------
 
+
 class TestLLMProviderAbstract:
     def test_cannot_instantiate_llm_provider(self):
         """LLMProvider is abstract and raises TypeError on direct instantiation."""
@@ -50,13 +51,14 @@ class TestLLMProviderAbstract:
                 return
                 yield  # type: ignore[unreachable]
 
-        provider = DummyProvider()
+        provider = DummyProvider(api_key="test-key")
         assert isinstance(provider, LLMProvider)
 
 
 # ---------------------------------------------------------------------------
 # LLMResponse creation and fields
 # ---------------------------------------------------------------------------
+
 
 class TestLLMResponse:
     def test_create_with_all_fields(self):
@@ -83,6 +85,7 @@ class TestLLMResponse:
 # ---------------------------------------------------------------------------
 # LLMResponse.get_tool_calls()
 # ---------------------------------------------------------------------------
+
 
 class TestLLMResponseToolCalls:
     def test_get_tool_calls_returns_only_tool_use_blocks(self):
@@ -138,6 +141,7 @@ class TestLLMResponseToolCalls:
 # ---------------------------------------------------------------------------
 # LLMResponse.has_tool_calls property
 # ---------------------------------------------------------------------------
+
 
 class TestLLMResponseHasToolCalls:
     def test_has_tool_calls_true_when_tools_present(self):

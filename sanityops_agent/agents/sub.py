@@ -4,17 +4,17 @@ Provides shorter default timeouts, limited tool access (excludes 'parent_only'
 tagged tools and blocks TaskTool), and a communication protocol via
 SubAgentRequest / SubAgentResponse.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sanityops_agent.agents.tool_agent import ToolAgent
 from sanityops_agent.core.agent import (
     AgentConfig,
     AgentResult,
-    BaseAgent,
     TerminationReason,
 )
-from sanityops_agent.core.message import Message, Role, ToolResultBlock
 from sanityops_agent.hooks.base import HookEvent, HookExecutor
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
 from sanityops_agent.tools.registry import ToolRegistry
@@ -48,7 +48,7 @@ class SubAgentResponse:
 # ---------------------------------------------------------------------------
 
 
-class SubAgent(BaseAgent):
+class SubAgent(ToolAgent):
     """Sub-agent with restricted tool access and shorter timeouts.
 
     Extends BaseAgent with:
@@ -81,7 +81,9 @@ class SubAgent(BaseAgent):
         super().__init__(merged_config)
 
         self.provider = provider
-        self.tool_registry = tool_registry or ToolRegistry()
+        self.tool_registry = (
+            tool_registry if tool_registry is not None else ToolRegistry()
+        )
         self.hook_executor = hook_executor or HookExecutor()
 
     # -- helpers ----------------------------------------------------------
@@ -89,24 +91,17 @@ class SubAgent(BaseAgent):
     def _get_available_tools(self) -> list:
         """Return tools available to the sub-agent, excluding 'parent_only'
         tagged tools and any tools in FORBIDDEN_TOOL_NAMES (e.g. task)."""
-        all_tools = self.tool_registry.list_all()
+        all_tools = super()._get_available_tools()
         return [
             t
             for t in all_tools
-            if "parent_only" not in t.tags
+            if "parent_only" not in (getattr(t, "tags", None) or ())
             and t.name not in self.FORBIDDEN_TOOL_NAMES
         ]
 
     def _is_tool_allowed(self, tool_name: str) -> bool:
         """Check whether a given tool name is permitted for sub-agents."""
-        if tool_name in self.FORBIDDEN_TOOL_NAMES:
-            return False
-        tool = self.tool_registry.get(tool_name)
-        if tool is None:
-            return False
-        if "parent_only" in tool.tags:
-            return False
-        return True
+        return tool_name in self._authorized_tools()
 
     # -- abstract implementations -----------------------------------------
 
@@ -114,7 +109,9 @@ class SubAgent(BaseAgent):
         """Call the LLM provider with the current context messages and
         available sub-agent tools."""
         if self.context is None:
-            raise RuntimeError("SubAgent called _call_llm but context is not initialised")
+            raise RuntimeError(
+                "SubAgent called _call_llm but context is not initialised"
+            )
 
         # Build hook context for BEFORE_LLM_CALL
         if self.hook_executor is not None:
@@ -126,7 +123,9 @@ class SubAgent(BaseAgent):
                 self._record_error(
                     "hook_error",
                     "LLM call blocked by hook",
-                    self.context.loop_count if hasattr(self.context, "loop_count") else 0,
+                    self.context.loop_count
+                    if hasattr(self.context, "loop_count")
+                    else 0,
                     recoverable=False,
                 )
                 raise RuntimeError("LLM call blocked by hook")
@@ -134,11 +133,11 @@ class SubAgent(BaseAgent):
         if self.provider is None:
             raise RuntimeError("SubAgent called _call_llm but no provider was set")
 
-        tool_defs = [t.to_tool_definition() for t in self._get_available_tools()]
+        tool_defs = self._tool_definitions()
         response: LLMResponse = await self.provider.create(
             messages=self.context.messages,
             tools=tool_defs if tool_defs else None,
-            **self._llm_call_kwargs(),
+            **await self._provider_kwargs(self.provider, tool_defs),
         )
 
         # AFTER_LLM_CALL hook
@@ -149,109 +148,6 @@ class SubAgent(BaseAgent):
             )
 
         return response
-
-    async def _execute_tools(self, tool_calls: list) -> None:
-        """Execute tool calls, adding results to the conversation context.
-
-        Skips tools that are not allowed for sub-agents (parent_only tagged
-        or explicitly forbidden like TaskTool)."""
-        if self.context is None:
-            raise RuntimeError("SubAgent called _execute_tools but context is not initialised")
-
-        for tool_call in tool_calls:
-            tool_name = tool_call.tool_name if hasattr(tool_call, "tool_name") else tool_call.get("name")
-            tool_input = tool_call.tool_input if hasattr(tool_call, "tool_input") else tool_call.get("input", {})
-            tool_call_id = tool_call.tool_call_id if hasattr(tool_call, "tool_call_id") else tool_call.get("id", "")
-
-            if not self._is_tool_allowed(tool_name):
-                # Inject an error result for forbidden tools
-                block = ToolResultBlock(
-                    tool_call_id=tool_call_id,
-                    tool_result_content=f"Error: tool '{tool_name}' is not available to sub-agents",
-                    is_error=True,
-                )
-                await self.context.add_message(
-                    Message(role=Role.ASSISTANT, content=[])  # placeholder
-                )
-                await self.context.add_message(
-                    Message(
-                        role=Role.USER,
-                        content=[block],
-                    )
-                )
-                self._record_error(
-                    "tool_error",
-                    f"Sub-agent attempted to call forbidden tool: {tool_name}",
-                    self.context.loop_count if hasattr(self.context, "loop_count") else 0,
-                    tool_name=tool_name,
-                    recoverable=False,
-                )
-                continue
-
-            # BEFORE_TOOL_EXEC hook
-            if self.hook_executor is not None:
-                hook_ctx = await self.hook_executor.execute(
-                    HookEvent.BEFORE_TOOL_EXEC,
-                    data={"tool_name": tool_name, "tool_input": tool_input},
-                )
-                if hook_ctx.blocked:
-                    block = ToolResultBlock(
-                        tool_call_id=tool_call_id,
-                        tool_result_content="Tool execution blocked by hook",
-                        is_error=True,
-                    )
-                    await self.context.add_message(
-                        Message(role=Role.USER, content=[block])
-                    )
-                    continue
-
-            tool = self.tool_registry.get(tool_name)
-            if tool is None:
-                block = ToolResultBlock(
-                    tool_call_id=tool_call_id,
-                    tool_result_content=f"Error: tool '{tool_name}' not found in registry",
-                    is_error=True,
-                )
-                await self.context.add_message(
-                    Message(role=Role.USER, content=[block])
-                )
-                continue
-
-            try:
-                result = await tool.run(**tool_input)
-            except Exception as e:
-                result_content = f"Error executing tool '{tool_name}': {e}"
-                block = ToolResultBlock(
-                    tool_call_id=tool_call_id,
-                    tool_result_content=result_content,
-                    is_error=True,
-                )
-                self._record_error(
-                    "tool_error",
-                    result_content,
-                    self.context.loop_count if hasattr(self.context, "loop_count") else 0,
-                    tool_name=tool_name,
-                    recoverable=True,
-                )
-                await self.context.add_message(
-                    Message(role=Role.USER, content=[block])
-                )
-                continue
-
-            block = ToolResultBlock(
-                tool_call_id=tool_call_id,
-                tool_result_content=result.content,
-                is_error=not result.success,
-                history_key=getattr(result, "history_key", None),
-            )
-            await self.context.add_message(Message(role=Role.USER, content=[block]))
-
-            # AFTER_TOOL_EXEC hook
-            if self.hook_executor is not None:
-                await self.hook_executor.execute(
-                    HookEvent.AFTER_TOOL_EXEC,
-                    data={"tool_name": tool_name, "success": result.success},
-                )
 
     # -- public helpers ---------------------------------------------------
 

@@ -1,4 +1,5 @@
 """Unit tests for agent/hooks/builtin.py"""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +21,7 @@ from sanityops_agent.hooks.builtin import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _ctx(event: HookEvent, **overrides) -> HookContext:
     """Build a HookContext with the given overrides."""
     ctx = HookContext(event=event)
@@ -32,11 +34,14 @@ def _ctx(event: HookEvent, **overrides) -> HookContext:
 # LoggingHook
 # ---------------------------------------------------------------------------
 
+
 class TestLoggingHook:
     def test_name_and_description(self):
         hook = LoggingHook()
         assert hook.name == "logging"
-        assert hook.description == "Logs agent lifecycle events at appropriate log levels"
+        assert (
+            hook.description == "Logs agent lifecycle events at appropriate log levels"
+        )
         assert hook.priority == 10
 
     def test_subscribed_events(self):
@@ -120,7 +125,8 @@ class TestLoggingHook:
         )
         with caplog.at_level(logging.ERROR):
             await hook.handle(ctx)
-        assert "Tool 'bash' failed: permission denied" in caplog.text
+        assert "Tool 'bash' failed" in caplog.text
+        assert "permission denied" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_on_error_logs_error(self, caplog):
@@ -128,7 +134,8 @@ class TestLoggingHook:
         ctx = _ctx(HookEvent.ON_ERROR, data={"error": "connection timeout"})
         with caplog.at_level(logging.ERROR):
             await hook.handle(ctx)
-        assert "Agent error: connection timeout" in caplog.text
+        assert "Agent error" in caplog.text
+        assert "connection timeout" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_on_termination_logs_info(self, caplog):
@@ -157,6 +164,7 @@ class TestLoggingHook:
 # ---------------------------------------------------------------------------
 # MetricsHook
 # ---------------------------------------------------------------------------
+
 
 class TestMetricsHook:
     def test_name_and_description(self):
@@ -230,9 +238,7 @@ class TestMetricsHook:
     @pytest.mark.asyncio
     async def test_before_tool_exec_increments_and_tracks_name(self):
         hook = MetricsHook()
-        await hook.handle(
-            _ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"})
-        )
+        await hook.handle(_ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"}))
         m = hook.get_metrics()
         assert m.total_tool_calls == 1
         assert m.tool_call_counts == {"bash": 1}
@@ -240,12 +246,8 @@ class TestMetricsHook:
     @pytest.mark.asyncio
     async def test_multiple_tool_calls_accumulate(self):
         hook = MetricsHook()
-        await hook.handle(
-            _ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"})
-        )
-        await hook.handle(
-            _ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"})
-        )
+        await hook.handle(_ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"}))
+        await hook.handle(_ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"}))
         await hook.handle(
             _ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "read_file"})
         )
@@ -289,15 +291,9 @@ class TestMetricsHook:
     @pytest.mark.asyncio
     async def test_multiple_errors_accumulate(self):
         hook = MetricsHook()
-        await hook.handle(
-            _ctx(HookEvent.ON_ERROR, data={"error_type": "timeout"})
-        )
-        await hook.handle(
-            _ctx(HookEvent.ON_ERROR, data={"error_type": "timeout"})
-        )
-        await hook.handle(
-            _ctx(HookEvent.ON_ERROR, data={"error_type": "auth_error"})
-        )
+        await hook.handle(_ctx(HookEvent.ON_ERROR, data={"error_type": "timeout"}))
+        await hook.handle(_ctx(HookEvent.ON_ERROR, data={"error_type": "timeout"}))
+        await hook.handle(_ctx(HookEvent.ON_ERROR, data={"error_type": "auth_error"}))
         m = hook.get_metrics()
         assert m.total_errors == 3
         assert m.error_counts == {"timeout": 2, "auth_error": 1}
@@ -324,9 +320,7 @@ class TestMetricsHook:
     @pytest.mark.asyncio
     async def test_tool_duration_tracking(self):
         hook = MetricsHook()
-        await hook.handle(
-            _ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"})
-        )
+        await hook.handle(_ctx(HookEvent.BEFORE_TOOL_EXEC, data={"tool_name": "bash"}))
         await asyncio.sleep(0.01)
         await hook.handle(
             _ctx(HookEvent.AFTER_TOOL_EXEC, data={"tool_name": "bash", "success": True})
@@ -359,6 +353,7 @@ class TestMetricsHook:
 # ---------------------------------------------------------------------------
 # SafetyCheckHook
 # ---------------------------------------------------------------------------
+
 
 class TestSafetyCheckHook:
     def test_name_and_description(self):
@@ -435,6 +430,7 @@ class TestSafetyCheckHook:
 # DebugHook
 # ---------------------------------------------------------------------------
 
+
 class TestDebugHook:
     def test_name_and_description(self):
         hook = DebugHook()
@@ -472,16 +468,18 @@ class TestDebugHook:
     @pytest.mark.asyncio
     async def test_logs_debug(self, caplog):
         hook = DebugHook()
-        ctx = _ctx(HookEvent.BEFORE_LOOP, data={"k": "v"})
+        ctx = _ctx(HookEvent.BEFORE_LOOP, data={"result": "fixture-sensitive-output"})
         with caplog.at_level(logging.DEBUG):
             await hook.handle(ctx)
         assert "DebugHook" in caplog.text
         assert "before_loop" in caplog.text
+        assert "fixture-sensitive-output" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
 # RateLimitHandlerHook
 # ---------------------------------------------------------------------------
+
 
 class TestRateLimitHandlerHook:
     def test_name_and_description(self):

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import Any
+
+from sanityops_agent.agents.sub import SubAgent
+from sanityops_agent.core.agent import TerminationReason
 from sanityops_agent.tools.base import Tool, ToolResult
-from sanityops_agent.tools.context import ToolContext
+from sanityops_agent.tools.context import ToolContext, current_tool_invocation
 
 
 class TaskTool(Tool):
@@ -11,6 +15,7 @@ class TaskTool(Tool):
     description = "Delegate tasks to subagents"
     parameters = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "goal": {
                 "type": "string",
@@ -35,7 +40,7 @@ class TaskTool(Tool):
 
     async def execute(self, **kwargs) -> ToolResult:
         goal = kwargs.get("goal")
-        if not goal:
+        if not isinstance(goal, str) or not goal.strip():
             return ToolResult(
                 content="Error: goal is required",
                 success=False,
@@ -43,7 +48,15 @@ class TaskTool(Tool):
             )
 
         subagent_context = kwargs.get("context", "")
-        system_prompt = kwargs.get("system_prompt", "")
+        invocation = current_tool_invocation.get()
+        system_prompt = kwargs.get("system_prompt") if invocation is None else None
+        system_prompt = (
+            system_prompt
+            or "You are a specialized sub-agent. Complete the assigned task."
+        )
+        task = f"Task: {goal}"
+        if subagent_context:
+            task += f"\n\nAdditional context: {subagent_context}"
 
         # Get the AgentFactory from ToolContext to create sub-agents
         factory = self.context.agent_factory if self.context else None
@@ -54,32 +67,44 @@ class TaskTool(Tool):
                 error="agent_factory not available",
             )
 
-        # Build the sub-agent system prompt
-        if not system_prompt:
-            if subagent_context:
-                system_prompt = (
-                    f"You are a specialized sub- Complete the following task.\n\n"
-                    # f"Task: {goal}\n\n"
-                    f"Additional context: {subagent_context}"
-                )
-            else:
-                system_prompt = "You are a specialized sub- Complete the following task."
-
-        # Create sub-agent via factory
-        sub_agent = factory.create_sub_agent(
-            system_prompt=system_prompt,
-        )
-
-        # Run the sub-agent
         try:
-            result = await sub_agent.run(f"Task: {goal}")
+            available = invocation.allowed_tools if invocation else None
+            overrides: dict[str, Any] = {}
+            toolsets = kwargs.get("toolsets")
+            if toolsets is not None:
+                if not isinstance(toolsets, list) or any(
+                    not isinstance(tag, str) for tag in toolsets
+                ):
+                    raise ValueError("toolsets must be a list of tool tags")
+                available = frozenset(
+                    tool.name
+                    for tool in factory.tool_registry.list_all()
+                    if (available is None or tool.name in available)
+                    and set(toolsets).intersection(getattr(tool, "tags", None) or ())
+                )
+            if available is not None:
+                overrides["allowed_tool_names"] = available
+            if invocation and invocation.agent.config.max_tokens is not None:
+                limit = invocation.agent.config.max_tokens
+                configured = factory.config.max_tokens
+                overrides["max_tokens"] = (
+                    min(limit, configured) if configured is not None else limit
+                )
+            sub_agent = factory.create_sub_agent(
+                system_prompt=system_prompt, **overrides
+            )
+            if invocation:
+                sub_agent._parent_agent = invocation.agent
+            result = await sub_agent.run(task)
         except Exception as e:
             return ToolResult(
                 content=f"Sub-agent execution failed: {e}",
                 success=False,
                 error=str(e),
+                metadata={"termination_reason": TerminationReason.ERROR.value},
             )
 
+        response = SubAgent.build_response(result)
         # Build result content from sub-agent output
         content_lines = []
         if result.text:
@@ -96,6 +121,13 @@ class TaskTool(Tool):
 
         return ToolResult(
             content="\n".join(content_lines),
+            success=response.success,
+            error=None
+            if response.success
+            else (
+                response.error
+                or f"Sub-agent stopped: {response.termination_reason.value}"
+            ),
             metadata={
                 "sub_agent_result": result,
                 "termination_reason": result.termination_reason.value,

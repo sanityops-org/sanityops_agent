@@ -7,6 +7,7 @@ Tests cover:
 - Hook blocking: BEFORE_LLM_CALL, BEFORE_TOOL_EXEC
 - Integration with BaseAgent.run()
 """
+
 from __future__ import annotations
 
 import time
@@ -602,6 +603,7 @@ class TestParentAgentRun:
     @pytest.mark.asyncio
     async def test_run_max_loops(self):
         DummyProvider()
+
         # Override to always return TOOL_USE so loop never terminates naturally
         class ToolLoopProvider(DummyProvider):
             async def create(self, messages, tools=None, **kwargs):

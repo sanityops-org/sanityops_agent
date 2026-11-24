@@ -1,6 +1,24 @@
 from __future__ import annotations
 
-from typing import Any
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sanityops_agent.core.agent import BaseAgent
+
+
+@dataclass(frozen=True)
+class ToolInvocation:
+    """Host-supplied state for one model-requested tool invocation."""
+
+    agent: BaseAgent
+    allowed_tools: frozenset[str]
+
+
+current_tool_invocation: ContextVar[ToolInvocation | None] = ContextVar(
+    "current_tool_invocation", default=None
+)
 
 
 class ToolContext:
@@ -55,4 +73,4 @@ class ToolContext:
 
     @property
     def allowed_tools(self) -> list[str]:
-        return self.get("allowed_tools", [])
+        return self.get("allowed_tools") or []

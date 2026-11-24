@@ -11,6 +11,53 @@ from sanityops_agent.core.message import (
     ToolDefinition,
 )
 from sanityops_agent.llm.base import LLMResponse
+from sanityops_agent.llm.exceptions import (
+    AuthenticationError,
+    ContextWindowExceededError,
+    LLMError,
+    ProviderUnavailableError,
+    RateLimitError,
+)
+
+
+def _extract_retry_after(exc: object) -> int | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        seconds = int(float(response.headers.get("retry-after", "")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def map_sdk_error(exception: Exception, provider: str) -> LLMError:
+    """Use SDK diagnostics for classification while exposing only safe metadata."""
+    kind = type(exception).__name__
+    status = getattr(getattr(exception, "response", None), "status_code", None)
+    suffix = f" (HTTP {status})" if type(status) is int else ""
+    if kind == "AuthenticationError" or status == 401:
+        return AuthenticationError(f"{provider} authentication failed{suffix}")
+    if kind == "RateLimitError" or status == 429:
+        return RateLimitError(
+            f"{provider} rate limit reached{suffix}",
+            retry_after=_extract_retry_after(exception),
+        )
+    if kind in ("APIError", "APIConnectionError", "OverloadedError") or (
+        type(status) is int and status >= 500
+    ):
+        return ProviderUnavailableError(f"{provider} unavailable{suffix}")
+    if kind == "BadRequestError" and status in (None, 400):
+        message = str(exception).lower()
+        too_long = "too long" in message or "too_long" in message
+        exceeds_context = "context" in message and (
+            "exceed" in message or "maximum" in message or too_long
+        )
+        if exceeds_context or (provider == "Anthropic" and too_long):
+            return ContextWindowExceededError(
+                f"{provider} context window exceeded{suffix}"
+            )
+    return LLMError(f"{provider} request failed{suffix}")
 
 
 def merge_consecutive_messages(
@@ -29,9 +76,7 @@ def merge_consecutive_messages(
       an invalid empty assistant turn.
     - Adjacent messages whose role is in ``merge_roles`` are concatenated in
       order; a role change always starts a new message, so the alternation of
-      the emitted payload is preserved. ``merge_roles`` is typed as a
-      ``frozenset[Role]`` — pass a literal set and it is coerced by the
-      annotation-checking caller; membership tests on it are O(1).
+      the emitted payload is preserved.
 
     Pure: returns new Message objects with new content lists. The input
     messages and their block lists are never mutated, and the content blocks

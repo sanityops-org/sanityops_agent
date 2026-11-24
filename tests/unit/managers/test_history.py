@@ -86,6 +86,7 @@ class TestToolHistoryStoreGet:
     @pytest.mark.asyncio
     async def test_get_preserves_timestamp(self):
         import time
+
         store = ToolHistoryStore()
         before = time.time()
         key = await store.store("search", "results", tool_call_id="c2")
@@ -124,7 +125,11 @@ class TestToolHistoryStoreConcurrent:
 
         async def store_many(prefix, count):
             for i in range(count):
-                await store.store(f"tool_{prefix}", f"content_{prefix}_{i}", tool_call_id=f"{prefix}_{i}")
+                await store.store(
+                    f"tool_{prefix}",
+                    f"content_{prefix}_{i}",
+                    tool_call_id=f"{prefix}_{i}",
+                )
 
         # Run two concurrent store tasks
         await asyncio.gather(

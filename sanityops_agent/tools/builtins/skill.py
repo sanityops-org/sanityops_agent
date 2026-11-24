@@ -70,7 +70,7 @@ class SkillTool(Tool):
         for s in skills:
             lines.append(f"  **{s['name']}**: {s['description']}")
             lines.append(f"    Path: {s['path']}")
-            lines.append(f"    Usage: skill(operation=\"load\", name=\"{s['name']}\")")
+            lines.append(f'    Usage: skill(operation="load", name="{s["name"]}")')
             lines.append("")
 
         return ToolResult(content="\n".join(lines))

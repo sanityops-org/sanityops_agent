@@ -1,62 +1,35 @@
-"""
-Streaming ReAct Agent — reads config from .env, streams LLM output with
-real-time logging of thought process, tool calls, and observations.
+"""Stream model answers and report tool progress.
 
 Supports OpenAI, Anthropic, and Gemini providers.
 
-Usage:
-    cp .env.example .env   # fill in your API key and base_url
-    uv run python examples/streaming_react_agent.py "What is 25 * 13?"
+Copy .env.example to .env in a trusted project directory, then run
+uv run python examples/streaming_react_agent.py "What's 25 * 13?"
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
-import json
-import logging
-import os
+import operator
 import sys
-import time
-from typing import Any
+from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# .env configuration via pydantic-settings
-# ---------------------------------------------------------------------------
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 from sanityops_agent.agents.factory import AgentFactory
-from sanityops_agent.core.agent import (
-    MAX_RETRY_DELAY,
-    AgentConfig,
-    AgentResult,
-    BaseAgent,
-)
-from sanityops_agent.core.message import (
-    ContentBlockUnion,
-    ContentType,
-    ErrorBlock,
-    FinishReason,
-    Message,
-    Role,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from sanityops_agent.agents.parent import ParentAgent
+from sanityops_agent.config import ProviderConfig
+from sanityops_agent.core.agent import AgentConfig
+from sanityops_agent.core.message import ContentType
+from sanityops_agent.hooks.base import Hook, HookContext, HookEvent, HookExecutor
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
+from sanityops_agent.llm.factory import ProviderFactory
+from sanityops_agent.llm.stream import collect_stream
 from sanityops_agent.managers.history import ToolHistoryStore
-from sanityops_agent.managers.skill import SkillManager
 from sanityops_agent.managers.todo import TodoManager
 from sanityops_agent.tools.base import Tool, ToolResult
-from sanityops_agent.tools.builtins import (
-    BashTool,
-    FileOpsTool,
-    GlobTool,
-    HistoryTool,
-    SkillTool,
-    TaskTool,
-    TodoTool,
-)
+from sanityops_agent.tools.builtins import HistoryTool, TaskTool, TodoTool
 from sanityops_agent.tools.context import ToolContext
 from sanityops_agent.tools.registry import ToolRegistry
 
@@ -64,514 +37,190 @@ from sanityops_agent.tools.registry import ToolRegistry
 class AgentEnv(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
-    # LLM provider
     LLM_PROVIDER: str = "openai"  # "openai" | "anthropic" | "gemini"
-    API_KEY: str = ""
+    API_KEY: str = Field(default="", repr=False, exclude=True)
     BASE_URL: str = ""
     MODEL: str = "gpt-4o-mini"
 
-    # Gemini-specific (Vertex AI)
+    # Gemini-specific (Vertex AI - optional, uses ADC if PROJECT is set)
     GOOGLE_CLOUD_PROJECT: str = ""
     GOOGLE_CLOUD_LOCATION: str = ""
-
-    # Thinking configuration (Gemini 2.5+)
-    THINKING_BUDGET: int = 0  # 0 = disabled, -1 = dynamic, >0 = token budget
+    # 0 = disabled, -1 = dynamic budget, >0 = specific token budget
+    THINKING_BUDGET: int = 0
     STORE_THINKING: bool = True
 
-    # Agent behaviour
     MAX_LOOPS: int = 30
     MAX_TOKENS: int | None = None
-    TOTAL_TIMEOUT: int = 300
+    TOTAL_TIMEOUT: float = 300
     TEMPERATURE: float = 0.7
-    SYSTEM_PROMPT: str = (
-        "You are a helpful assistant. Use tools when needed. "
-        "Think step by step."
-    )
+    SYSTEM_PROMPT: str = "You are a helpful assistant. Use tools when needed."
 
 
-# ---------------------------------------------------------------------------
-# Terminal colour helpers
-# ---------------------------------------------------------------------------
-class C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    THINK = "\033[36m"       # cyan
-    ACT = "\033[33m"         # yellow
-    OBSERVE = "\033[32m"     # green
-    ANSWER = "\033[1;35m"    # bold magenta
-    ERROR = "\033[1;31m"     # bold red
-    DIVIDER = "\033[2;90m"   # dim grey
-
-
-# Maximum characters to preview in [OBSERVE] output
-MAX_RESULT_PREVIEW = 200
-
-# Characters permitted inside a calculator expression (module-level so the
-# set is not rebuilt on every tool call).
-CALCULATOR_ALLOWED_CHARS = frozenset("0123456789+-*/.()% ")
-
-
-def _print_tag(tag: str, colour: str) -> None:
-    print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
-    print(f"{colour}{C.BOLD}{tag}{C.RESET}")
-
-
-# ---------------------------------------------------------------------------
-# Simple built-in tools for the demo
-# ---------------------------------------------------------------------------
 class CalculatorTool(Tool):
-    """Evaluate a simple arithmetic expression safely.
-
-    Note: Only basic arithmetic is supported (+, -, *, /, **, %, ()).
-    Scientific notation (e.g., 1e10) is not supported. Extremely deep
-    nesting (>~900 paren levels) is rejected by Python's recursion limit;
-    the generic RecursionError is caught and returned as a failed result.
-    """
+    """Evaluate bounded arithmetic expressions."""
 
     name = "calculator"
-    description = (
-        "Evaluate a math expression. "
-        "Supports: +, -, *, /, ** (power), % (modulo), (). "
-        "No scientific notation."
-    )
+    description = "Evaluate arithmetic with +, -, *, /, //, %, ** and parentheses."
     parameters = {
         "type": "object",
-        "properties": {
-            "expression": {"type": "string", "description": "Math expression, e.g. '25 * 13'"},
-        },
+        "properties": {"expression": {"type": "string", "maxLength": 256}},
         "required": ["expression"],
+        "additionalProperties": False,
     }
+    _binary = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+    }
+    _unary = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
-    async def execute(self, expression: str, **kwargs: Any) -> ToolResult:
-        if any(c not in CALCULATOR_ALLOWED_CHARS for c in expression):
-            return ToolResult(content=f"Error: invalid characters in '{expression}'", success=False)
+    @classmethod
+    def _evaluate(cls, node: ast.AST) -> int | float:
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            result = node.value
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in cls._unary:
+            result = cls._unary[type(node.op)](cls._evaluate(node.operand))
+        elif isinstance(node, ast.BinOp) and type(node.op) in cls._binary:
+            left, right = cls._evaluate(node.left), cls._evaluate(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("Exponent out of range")
+            result = cls._binary[type(node.op)](left, right)
+        else:
+            raise ValueError("Unsupported arithmetic expression")
+        if type(result) not in (int, float) or not -1e100 <= result <= 1e100:
+            raise ValueError("Result out of range")
+        return result
+
+    async def execute(self, expression: str, **kwargs) -> ToolResult:
+        if len(expression) > 256:
+            return ToolResult("Expression is too long", success=False)
         try:
-            # Safe evaluation using AST parsing instead of eval()
-            # Supports: +, -, *, /, **, %, () and numeric literals
-            import ast
-            tree = ast.parse(expression, mode='eval')
-            # Only allow BinOp with allowed operators and numeric literals
-            def _eval_node(node):
-                if isinstance(node, ast.Constant):
-                    if isinstance(node.value, int | float):
-                        return node.value
-                    raise ValueError(f"Invalid constant type: {type(node.value)}")
-                if isinstance(node, ast.BinOp):
-                    left = _eval_node(node.left)
-                    right = _eval_node(node.right)
-                    if isinstance(node.op, ast.Add):
-                        return left + right
-                    if isinstance(node.op, ast.Sub):
-                        return left - right
-                    if isinstance(node.op, ast.Mult):
-                        return left * right
-                    if isinstance(node.op, ast.Div):
-                        return left / right
-                    if isinstance(node.op, ast.Mod):
-                        return left % right
-                    if isinstance(node.op, ast.Pow):
-                        return left ** right
-                    if isinstance(node.op, ast.FloorDiv):
-                        return left // right
-                    raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
-                if isinstance(node, ast.UnaryOp):
-                    if isinstance(node.op, ast.USub):
-                        return -_eval_node(node.operand)
-                    if isinstance(node.op, ast.UAdd):
-                        return _eval_node(node.operand)
-                if isinstance(node, ast.Expression):
-                    return _eval_node(node.body)
-                raise ValueError(f"Unsupported expression element: {type(node).__name__}")
-            result = _eval_node(tree)
-            return ToolResult(content=str(result))
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", success=False)
+            tree = ast.parse(expression.strip(), mode="eval")
+            return ToolResult(str(self._evaluate(tree.body)))
+        except (SyntaxError, ValueError, ArithmeticError):
+            return ToolResult("Invalid or out-of-range arithmetic", success=False)
 
 
 class CurrentTimeTool(Tool):
-    """Return the current local time."""
-
     name = "current_time"
-    description = "Return the current local time as a string."
-    parameters = {"type": "object", "properties": {}, "required": []}
+    description = "Return the current local time"
+    parameters = {"type": "object", "properties": {}, "additionalProperties": False}
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
-        from datetime import datetime
-        return ToolResult(content=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    async def execute(self, **kwargs) -> ToolResult:
+        return ToolResult(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
-# ---------------------------------------------------------------------------
-# Provider factory from env
-# ---------------------------------------------------------------------------
+class ToolProgress(Hook):
+    events = [HookEvent.AFTER_TOOL_EXEC]
+
+    async def handle(self, ctx: HookContext) -> HookContext:
+        status = "failed" if ctx.is_error else "completed"
+        print(f"[Tool] {ctx.tool_name} {status}", file=sys.stderr)
+        return ctx
+
+
 def create_provider(env: AgentEnv) -> LLMProvider:
-    """Instantiate an LLM provider from environment config."""
-    # Providers are imported lazily so the demo runs with only the SDK it needs.
-    provider_type = env.LLM_PROVIDER.lower()
-    if provider_type == "anthropic":
-        from sanityops_agent.llm.providers.anthropic import AnthropicProvider
-
-        kwargs: dict[str, Any] = {"api_key": env.API_KEY, "model": env.MODEL}
-        if env.BASE_URL:
-            kwargs["base_url"] = env.BASE_URL
-        return AnthropicProvider(**kwargs)
-
-    elif provider_type == "gemini":
-        from sanityops_agent.llm.providers.gemini import GeminiProvider
-
-        kwargs = {
-            "api_key": env.API_KEY,
-            "model": env.MODEL,
-            "store_thinking": env.STORE_THINKING,
-        }
-        if env.THINKING_BUDGET != 0:
-            # -1 maps to None (dynamic budget); >0 maps to a token budget.
-            if env.THINKING_BUDGET < -1:
-                logging.getLogger(__name__).warning(
-                    "THINKING_BUDGET=%d is invalid. Only -1 (dynamic) or >0 "
-                    "(token budget) are valid. Defaulting to dynamic budget.",
-                    env.THINKING_BUDGET,
-                )
-            kwargs["thinking_budget"] = (
-                env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
-            )
-        if env.GOOGLE_CLOUD_PROJECT:
-            kwargs["project_id"] = env.GOOGLE_CLOUD_PROJECT
-            if env.GOOGLE_CLOUD_LOCATION:
-                kwargs["location"] = env.GOOGLE_CLOUD_LOCATION
-        return GeminiProvider(**kwargs)
-
-    else:  # openai (default)
-        if provider_type != "openai":
-            logging.getLogger(__name__).warning(
-                "Unknown LLM_PROVIDER '%s', defaulting to OpenAI. "
-                "Valid providers: openai, anthropic, gemini",
-                env.LLM_PROVIDER,
-            )
-        from sanityops_agent.llm.providers.openai import OpenAIProvider
-
-        kwargs = {"api_key": env.API_KEY, "model": env.MODEL}
-        if env.BASE_URL:
-            kwargs["base_url"] = env.BASE_URL
-        return OpenAIProvider(**kwargs)
+    if env.THINKING_BUDGET < -1:
+        sys.exit(
+            f"THINKING_BUDGET={env.THINKING_BUDGET} is invalid. "
+            "Only -1 (dynamic) or >0 (token budget) are supported."
+        )
+    config = ProviderConfig(
+        _env_file=None,
+        PROVIDER=env.LLM_PROVIDER,
+        API_KEY=env.API_KEY,
+        BASE_URL=env.BASE_URL or None,
+        MODEL_ID=env.MODEL,
+        # Thinking budget 0 and -1 both disable the explicit budget field.
+        GEMINI_THINKING_BUDGET=(
+            env.THINKING_BUDGET if env.THINKING_BUDGET > 0 else None
+        ),
+        GEMINI_STORE_THINKING=env.STORE_THINKING,
+        GEMINI_PROJECT_ID=env.GOOGLE_CLOUD_PROJECT or None,
+        GEMINI_LOCATION=env.GOOGLE_CLOUD_LOCATION or None,
+    )
+    return ProviderFactory.create(config)
 
 
-# ---------------------------------------------------------------------------
-# Streaming ReAct Agent
-# ---------------------------------------------------------------------------
-class StreamingReActAgent(BaseAgent):
-    """ReAct agent that streams the LLM output and logs each phase.
-
-    Overrides the BaseAgent loop to use provider.stream() and print
-    chunks in real-time:
-      [THINK]   — streaming text output
-      [ACT]     — tool name + arguments when tool_use detected
-      [OBSERVE] — tool result after execution
-      [ANSWER]  — final text answer
-    """
-
-    def __init__(
-        self,
-        config: AgentConfig,
-        provider: LLMProvider,
-        tool_registry: ToolRegistry,
-    ):
-        super().__init__(config)
-        self.provider = provider
-        self.tool_registry = tool_registry
-
-    # -- overrides required by Basesanityops_agent.run() --
+class StreamingReActAgent(ParentAgent):
+    """Use the parent agent's policy and execute complete streamed responses."""
 
     async def _call_llm(self) -> LLMResponse:
-        """Stream the LLM response, print chunks in real-time, and buffer into LLMResponse."""
-        tool_defs = self.tool_registry.to_tool_definitions(
-            self.config.allowed_tool_tags,
-        )
+        assert self.context is not None
+        tools = self._tool_definitions()
+        kwargs = await self._provider_kwargs(self.provider, tools)
 
-        # Buffers for streamed content
-        text_buffer: str = ""
-        thinking_buffer: str = ""
-        # key: tool index -> {name, input_str, tool_call_id}
-        tool_call_buffers: dict[int, dict[str, Any]] = {}
-        stop_reason = FinishReason.END_TURN
-        thinking_tag_printed = False
-        # Providers that report usage during streaming (Anthropic, on the final
-        # message_delta) populate this; others leave it None.
-        stream_usage: dict[str, Any] | None = None
-        # Text of any ERROR chunks seen, surfaced as ErrorBlocks in the
-        # returned LLMResponse so consumers can detect stream failures.
-        stream_errors: list[str] = []
-
-        # Stream and print in real-time
-        async for chunk in self.provider.stream(
-            self.context.messages, tools=tool_defs, **self._llm_call_kwargs()
-        ):
-            if chunk.type == ContentType.THINKING and chunk.delta:
-                # Print the tag lazily, on the first thinking chunk, so a
-                # response with no reasoning does not emit an empty [THINK].
-                if not thinking_tag_printed:
-                    _print_tag("[THINK]", C.THINK)
-                    thinking_tag_printed = True
-                thinking_buffer += chunk.delta
-                print(f"{C.DIM}{chunk.delta}{C.RESET}", end="", flush=True)
-
-            elif chunk.type == ContentType.TEXT and chunk.delta:
-                text_buffer += chunk.delta
+        def display(chunk):
+            if chunk.type is ContentType.TEXT and isinstance(chunk.delta, str):
                 print(chunk.delta, end="", flush=True)
 
-            elif chunk.type == ContentType.TOOL_USE and chunk.delta:
-                # Identify which tool call this chunk belongs to
-                idx = chunk.index
-                if idx not in tool_call_buffers:
-                    tool_call_buffers[idx] = {
-                        "name": "",
-                        "input_str": "",
-                        "tool_call_id": chunk.tool_call_id or f"stream_call_{idx}",
-                    }
-
-                buf = tool_call_buffers[idx]
-
-                if isinstance(chunk.delta, dict):
-                    # OpenAI format: {"name": "...", "arguments": "..."}
-                    # Anthropic format: {"name": "...", "input": {...}}
-                    if "name" in chunk.delta:
-                        chunk_name = chunk.delta["name"]
-                        if chunk_name:
-                            buf["name"] = chunk_name
-
-                    # OpenAI uses "arguments" (string, incremental JSON fragment)
-                    if "arguments" in chunk.delta:
-                        buf["input_str"] += chunk.delta["arguments"]
-
-                    # Anthropic uses "input" (dict, full replacement each chunk)
-                    if "input" in chunk.delta:
-                        inp = chunk.delta["input"]
-                        buf["input_str"] = json.dumps(inp) if isinstance(inp, dict) else str(inp)
-
-                    # Track tool_call_id
-                    if chunk.tool_call_id:
-                        buf["tool_call_id"] = chunk.tool_call_id
-
-            if chunk.usage:
-                # usage may arrive on its own chunk or alongside the finish
-                # reason; keep the latest report.
-                stream_usage = chunk.usage
-
-            if chunk.finish_reason:
-                # Last finish_reason wins; the stream ends with the final value
-                stop_reason = chunk.finish_reason
-
-            elif chunk.type == ContentType.ERROR:
-                # No built-in adapter currently emits ERROR chunks, but handle
-                # them so a future provider cannot fail silently.
-                error_text = str(chunk.delta or "unknown stream error")
-                logging.getLogger(__name__).error(
-                    "Stream error from provider: %s", error_text
-                )
-                print(f"\n{C.ERROR}[STREAM ERROR] {error_text}{C.RESET}")
-                stream_errors.append(error_text)
-
-        # Close the streamed line, but only if something was streamed — a
-        # tool-only response would otherwise emit a stray blank line.
-        if thinking_tag_printed or text_buffer:
-            print()
-
-        # Build content blocks from buffered data
-        content: list[ContentBlockUnion] = []
-        if thinking_buffer.strip():
-            content.append(ThinkingBlock(thinking=thinking_buffer.strip()))
-        if text_buffer.strip():
-            content.append(TextBlock(text=text_buffer.strip()))
-        # Carry stream errors into the response as ErrorBlocks so callers can
-        # detect a partial/failed stream programmatically, not just visually.
-        for error_text in stream_errors:
-            content.append(ErrorBlock(error_code="stream_error", error_message=error_text))
-
-        for idx in sorted(tool_call_buffers.keys()):
-            buf = tool_call_buffers[idx]
-            name = buf.get("name", "unknown_tool")
-            input_str = buf.get("input_str", "{}")
-            try:
-                tool_input = json.loads(input_str) if input_str else {}
-            except json.JSONDecodeError:
-                # Malformed JSON in tool arguments. Keep the raw text under a
-                # reserved key so the tool still receives something actionable
-                # and the full payload is visible in logs.
-                logging.getLogger(__name__).warning(
-                    "Malformed JSON in tool input for %s (raw: %r); "
-                    "passing as {\"_raw_input\": ...}",
-                    name,
-                    input_str[:200],
-                )
-                tool_input = {"_raw_input": input_str}
-            content.append(ToolUseBlock(
-                tool_call_id=buf.get("tool_call_id", f"stream_call_{idx}"),
-                tool_name=name,
-                tool_input=tool_input,
-            ))
-
-        # Normalize to total_tokens (the key the agent loop and compaction
-        # accounting read). Anthropic reports input_tokens/output_tokens.
-        usage: dict = {"total_tokens": 0}
-        if stream_usage:
-            total = stream_usage.get("total_tokens")
-            if total is None:
-                total = (stream_usage.get("input_tokens") or 0) + (
-                    stream_usage.get("output_tokens") or 0
-                )
-            usage = {**stream_usage, "total_tokens": total}
-
-        return LLMResponse(
-            content=content,
-            stop_reason=stop_reason,
-            model=self.provider.model if hasattr(self.provider, "model") else "unknown",
-            usage=usage,
+        result = await collect_stream(
+            self.provider.stream(self.context.messages, tools=tools, **kwargs),
+            model=getattr(self.provider, "model", "unknown"),
+            on_chunk=display,
         )
-
-    async def _call_llm_with_retry(self) -> LLMResponse:
-        """Agent-level retry with recoverable check and error logging."""
-        for attempt in range(self.config.max_retries):
-            try:
-                return await self._call_llm()
-            except Exception as e:
-                recoverable = getattr(e, "recoverable", False)
-                print(
-                    f"\n{C.ERROR}[ERROR] LLM call failed "
-                    f"(attempt {attempt+1}/{self.config.max_retries}): {e}{C.RESET}"
-                )
-                self._record_error("llm_error", str(e), 0, recoverable=recoverable)
-                if not recoverable:
-                    raise
-                if attempt == self.config.max_retries - 1:
-                    raise
-                delay = self._compute_retry_delay(e, attempt)
-                await asyncio.sleep(delay)
-
-    def _compute_retry_delay(self, e: Exception, attempt: int) -> float:
-        """Prefer the provider's Retry-After, capped; fall back to backoff."""
-        retry_after = getattr(e, "retry_after", None)
-        if retry_after and retry_after > 0:
-            return float(min(retry_after, MAX_RETRY_DELAY))
-        return float(min(2**attempt, MAX_RETRY_DELAY))
-
-    async def _execute_tools(self, tool_calls: list) -> None:
-        """Execute tools and log the observations."""
-        for tc in tool_calls:
-            tool_name = tc.tool_name
-            tool_input = tc.tool_input
-            tool_call_id = tc.tool_call_id
-
-            _print_tag(f"[ACT] Calling {tool_name}({json.dumps(tool_input)})", C.ACT)
-
-            tool = self.tool_registry.get(tool_name)
-            if tool is None:
-                result_content = f"Tool not found: {tool_name}"
-                is_error = True
-            else:
-                try:
-                    result = await tool.run(**tool_input)
-                    result_content = result.content
-                    is_error = not result.success
-                except Exception as e:
-                    result_content = f"Tool error: {e}"
-                    is_error = True
-
-            _print_tag(f"[OBSERVE] {result_content[:MAX_RESULT_PREVIEW]}{'...' if len(result_content) > MAX_RESULT_PREVIEW else ''}", C.OBSERVE)
-
-            # Role.TOOL is the neutral internal representation: the Anthropic
-            # adapter merges it into the following user turn (Role.TOOL and
-            # Role.USER coalesce), OpenAI maps it to role:"tool", and Gemini
-            # treats it as a user message. No provider-specific branch needed.
-            await self.context.add_message(
-                Message(
-                    role=Role.TOOL,
-                    content=[
-                        ToolResultBlock(
-                            tool_call_id=tool_call_id,
-                            tool_result_content=result_content,
-                            is_error=is_error,
-                        )
-                    ],
-                )
+        print()
+        if self._usage is None:
+            self._record_usage(result.usage)
+        if self.hook_executor:
+            await self.hook_executor.execute(
+                HookEvent.AFTER_LLM_CALL, {"response": result}
             )
+        return result
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 async def main():
-    # Load .env
-    if not os.path.exists(".env"):
-        print(f"{C.ERROR}Error: .env file not found.{C.RESET}")
-        print("Create a .env file with your API credentials. See .env.example for format.")
-        sys.exit(1)
-
     env = AgentEnv()
+    if not env.API_KEY and not env.GOOGLE_CLOUD_PROJECT:
+        sys.exit("API_KEY is required in the environment or a trusted .env")
+    if env.LLM_PROVIDER.lower() == "anthropic" and not env.MAX_TOKENS:
+        sys.exit("MAX_TOKENS must be a positive integer when using Anthropic")
 
-    if not env.API_KEY:
-        print(f"{C.ERROR}Error: API_KEY is not set in .env{C.RESET}")
-        sys.exit(1)
-
-    # Build provider and tools
-    provider = create_provider(env)
-
-    # Create shared context for tools
-    tool_context = ToolContext()
-    tool_context.set("todo_manager", TodoManager())
-    tool_context.set("skill_manager", SkillManager())
-    tool_context.set("history_store", ToolHistoryStore())
-    tool_context.set("agent_factory", AgentFactory(provider))
-
-    registry = ToolRegistry(context=tool_context)
-    registry.register(CalculatorTool())
-    registry.register(CurrentTimeTool())
-    registry.register(BashTool())
-    registry.register(FileOpsTool())
-    registry.register(GlobTool())
-    registry.register(HistoryTool())
-    registry.register(SkillTool())
-    registry.register(TodoTool())
-    registry.register(TaskTool())
-
-    # Build config from env
     config = AgentConfig(
         max_loops=env.MAX_LOOPS,
         max_tokens=env.MAX_TOKENS,
         total_timeout=env.TOTAL_TIMEOUT,
         system_prompt=env.SYSTEM_PROMPT,
     )
+    provider = create_provider(env)
+    context = ToolContext()
+    context.set("todo_manager", TodoManager())
+    context.set("history_store", ToolHistoryStore())
+    registry = ToolRegistry(context)
+    for tool in (
+        CalculatorTool(),
+        CurrentTimeTool(),
+        HistoryTool(),
+        TodoTool(),
+        TaskTool(),
+    ):
+        registry.register(tool)
 
-    # Build streaming agent
-    agent = StreamingReActAgent(config, provider, registry)
+    hooks = HookExecutor()
+    hooks.register(ToolProgress())
+    factory = AgentFactory(provider, config, registry, hooks)
+    agent = StreamingReActAgent(config, provider, registry, hooks)
 
-    # Get user input from CLI args or stdin
-    if len(sys.argv) > 1:
-        prompt = " ".join(sys.argv[1:])
-    else:
-        prompt = input(f"\n{C.BOLD}You: {C.RESET}")
-
-    print(f"\n{C.DIM}{'═' * 60}{C.RESET}")
-    print(f"{C.BOLD}Model: {env.MODEL} | Provider: {env.LLM_PROVIDER}{C.RESET}")
-    print(f"{C.DIM}{'═' * 60}{C.RESET}")
-
-    # Run
-    t0 = time.time()
-    result: AgentResult = await agent.run(prompt)
-    elapsed = time.time() - t0
-
-    # Final summary
-    print(f"\n{C.DIVIDER}{'─' * 60}{C.RESET}")
-    print(f"{C.ANSWER}{C.BOLD}[ANSWER] Summary{C.RESET}")
-    print(f"  Reason:       {result.termination_reason.value}")
-    print(f"  Loops:        {result.loops_used}")
-    print(f"  Time:         {elapsed:.2f}s")
-    if result.text:
-        print(f"\n{C.ANSWER}{result.text}{C.RESET}")
-    if result.error:
-        print(f"\n{C.ERROR}Error: {result.error}{C.RESET}")
-    print(f"{C.DIVIDER}{'─' * 60}{C.RESET}")
-
-    await provider.close()
+    try:
+        prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("You: ")
+        result = await agent.run(prompt)
+        usage = (
+            str(result.tokens_used)
+            if result.usage_complete
+            else f"{result.tokens_used} reported"
+        )
+        print(
+            f"[{result.termination_reason.value}] {result.loops_used} turns, {usage} tokens"
+        )
+        if result.error:
+            print(result.error, file=sys.stderr)
+    finally:
+        factory.close()
+        await provider.close()
 
 
 if __name__ == "__main__":

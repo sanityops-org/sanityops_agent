@@ -1,4 +1,5 @@
 """Unit tests for AgentFactory."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -85,6 +86,19 @@ class TestAgentFactoryInit:
         assert factory.config.max_loops == 5
         assert factory.tool_registry is registry
         assert factory.hook_executor is hook_exec
+
+    def test_close_clears_agent_factory_from_context(self):
+        registry = _make_registry()
+        factory = _make_factory(registry=registry)
+        assert registry.context.agent_factory is factory
+
+        factory.close()
+        assert registry.context.agent_factory is None
+
+        # Calling close() on an older factory should not clear a newer one
+        other = _make_factory(registry=registry)
+        factory.close()
+        assert registry.context.agent_factory is other
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +214,39 @@ class TestCreateSubAgent:
         assert overridden.config.max_tokens == 4096
         assert overridden.config.max_empty_responses == 5
 
+    def test_sub_agent_inherits_factory_config_with_tighter_caps(self):
+        factory = AgentFactory(
+            provider=_make_provider(),
+            config=AgentConfig(
+                max_loops=30,
+                total_timeout=300,
+                token_budget=25000,
+                max_retries=5,
+                allowed_tool_tags=["read"],
+            ),
+            tool_registry=_make_registry(),
+        )
+        agent = factory.create_sub_agent()
+        assert agent.config.max_loops == 10
+        assert agent.config.total_timeout == 120
+        assert agent.config.token_budget == 25000
+        assert agent.config.max_retries == 5
+        assert agent.config.allowed_tool_tags == ["read"]
+        assert agent.config.allowed_tool_tags is not factory.config.allowed_tool_tags
+
+        tight_factory = AgentFactory(
+            provider=_make_provider(),
+            config=AgentConfig(max_loops=4, total_timeout=45),
+            tool_registry=_make_registry(),
+        )
+        tight_agent = tight_factory.create_sub_agent()
+        assert tight_agent.config.max_loops == 4
+        assert tight_agent.config.total_timeout == 45
+
+        overridden = factory.create_sub_agent(max_retries=1, token_budget=60000)
+        assert overridden.config.max_retries == 1
+        assert overridden.config.token_budget == 60000
+
 
 # ---------------------------------------------------------------------------
 # Skill injection tests
@@ -276,7 +323,7 @@ class TestBuildSkillPrompt:
         manager = SkillManager(skills_dir=str(skills_dir))
         result = AgentFactory._build_skill_prompt(manager)
 
-        assert "Use `skill(operation=\"load\", name=\"<skill_name>\")`" in result
+        assert 'Use `skill(operation="load", name="<skill_name>")`' in result
 
     def test_markdown_format(self, tmp_path):
         """Should use proper Markdown formatting."""
@@ -293,6 +340,30 @@ class TestBuildSkillPrompt:
         # Check Markdown structure
         assert result.startswith("\n# Available Skills")
         assert "- **my_skill**:" in result  # Bold name in list item
+
+    def test_skips_skills_with_empty_names(self):
+        """Skills missing a valid name should be skipped."""
+        manager = MagicMock()
+        manager.describe_available.return_value = [
+            {"name": "", "description": "Unnamed"},
+            {"name": "   ", "description": "Blank"},
+            {"name": "valid_skill", "description": "Valid description"},
+        ]
+
+        result = AgentFactory._build_skill_prompt(manager)
+        assert "**valid_skill**" in result
+        assert "Unnamed" not in result
+        assert "Blank" not in result
+
+    def test_returns_empty_string_when_all_skill_names_empty(self):
+        """When every skill lacks a valid name, return empty string."""
+        manager = MagicMock()
+        manager.describe_available.return_value = [
+            {"name": "", "description": "Unnamed"},
+            {"description": "Missing name"},
+        ]
+
+        assert AgentFactory._build_skill_prompt(manager) == ""
 
 
 class TestSkillInjection:
@@ -382,11 +453,11 @@ class TestSkillInjection:
             tool_registry=registry,
             inject_skill_info=True,
         )
-        agent = factory.create_sub_agent(system_prompt="You are a sub-sanityops_agent.")
+        agent = factory.create_sub_agent(system_prompt="You are a sub-agent.")
 
         # Sub-agent should NOT have skill info injected
         assert "# Available Skills" not in agent.config.system_prompt
-        assert agent.config.system_prompt == "You are a sub-sanityops_agent."
+        assert agent.config.system_prompt == "You are a sub-agent."
 
     def test_skill_info_appended_to_user_prompt(self, tmp_path):
         """Skill info should be appended after user's system prompt."""

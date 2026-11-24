@@ -1,4 +1,5 @@
 """Unit tests for agent.tools.base — ToolResult and Tool"""
+
 from __future__ import annotations
 
 import pytest
@@ -7,6 +8,7 @@ from sanityops_agent.tools.base import Tool, ToolResult
 from sanityops_agent.tools.context import ToolContext
 
 # --- ToolResult tests ---
+
 
 class TestToolResultConstruction:
     """ToolResult construction with defaults"""
@@ -62,6 +64,7 @@ class TestToolResultToContentBlock:
 
 
 # --- Tool tests ---
+
 
 class ConcreteTool(Tool):
     """Minimal concrete Tool for testing"""

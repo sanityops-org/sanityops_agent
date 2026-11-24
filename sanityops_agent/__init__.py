@@ -5,7 +5,7 @@ and plugin architecture.
 Install via: pip install sanityops_agent
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # Config
 # Agents
@@ -33,6 +33,7 @@ from sanityops_agent.core import (
     FinishReason,
     Message,
     MessageToolResult,
+    RedactedThinkingBlock,
     Role,
     StreamChunk,
     TerminationReason,
@@ -43,6 +44,7 @@ from sanityops_agent.core import (
     ToolResultSummary,
     ToolUseBlock,
 )
+from sanityops_agent.core.agent import AgentConfig as RuntimeAgentConfig
 
 # Hooks
 from sanityops_agent.hooks import (
@@ -102,6 +104,7 @@ __all__ = [
     # Config
     "AppConfig",
     "AgentConfig",
+    "RuntimeAgentConfig",
     "ProviderConfig",
     "ToolConfig",
     # Core Agent
@@ -122,6 +125,7 @@ __all__ = [
     "ContentBlock",
     "TextBlock",
     "ThinkingBlock",
+    "RedactedThinkingBlock",
     "ToolUseBlock",
     "ToolResultBlock",
     "ErrorBlock",

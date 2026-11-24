@@ -1,10 +1,12 @@
 """Unit tests for sanityops_agent.tools.builtins.task - TaskTool"""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from sanityops_agent.core.agent import TerminationReason
 from sanityops_agent.tools.builtins.task import TaskTool
 from sanityops_agent.tools.context import ToolContext
 
@@ -41,7 +43,7 @@ class TestTaskToolExecute:
         # Mock the sub-agent result
         mock_result = MagicMock()
         mock_result.text = "Sub-agent completed the task successfully."
-        mock_result.termination_reason = MagicMock(value="end_turn")
+        mock_result.termination_reason = TerminationReason.END_TURN
         mock_result.loops_used = 3
         mock_result.tokens_used = 500
         mock_result.time_elapsed = 1.5
@@ -68,14 +70,16 @@ class TestTaskToolExecute:
         assert result.metadata["sub_agent_result"] is mock_result
         mock_factory.create_sub_agent.assert_called_once()
         # TaskTool prefixes goal with "Task: "
-        mock_sub_agent.run.assert_called_once_with("Task: Review this file")
+        mock_sub_agent.run.assert_called_once_with(
+            "Task: Review this file\n\nAdditional context: Focus on error handling"
+        )
 
     @pytest.mark.asyncio
     async def test_execute_forwards_system_prompt(self):
         """TaskTool forwards custom system_prompt to sub-agent."""
         mock_result = MagicMock()
         mock_result.text = "done"
-        mock_result.termination_reason = MagicMock(value="end_turn")
+        mock_result.termination_reason = TerminationReason.END_TURN
         mock_result.loops_used = 1
         mock_result.tokens_used = 100
         mock_result.time_elapsed = 0.5

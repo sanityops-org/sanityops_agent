@@ -37,7 +37,9 @@ def tool_context(tmp_path):
 def sample_messages():
     """Sample conversation messages."""
     return [
-        Message(role=Role.SYSTEM, content=[TextBlock(text="You are a helpful assistant.")]),
+        Message(
+            role=Role.SYSTEM, content=[TextBlock(text="You are a helpful assistant.")]
+        ),
         Message(role=Role.USER, content=[TextBlock(text="Hello!")]),
     ]
 

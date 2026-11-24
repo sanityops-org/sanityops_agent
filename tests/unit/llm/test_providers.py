@@ -14,7 +14,9 @@ from sanityops_agent.llm.providers.anthropic import AnthropicProvider
 from sanityops_agent.llm.providers.openai import OpenAIProvider
 
 
-def _make_httpx_response(status_code: int, json_body: dict | None = None) -> httpx.Response:
+def _make_httpx_response(
+    status_code: int, json_body: dict | None = None
+) -> httpx.Response:
     """Create a minimal httpx.Response for SDK exception constructors."""
     return httpx.Response(
         status_code=status_code,
@@ -23,31 +25,21 @@ def _make_httpx_response(status_code: int, json_body: dict | None = None) -> htt
     )
 
 
-def _make_chat_completion(text: str = "Hello, world!"):
-    """Create a minimal ChatCompletion for OpenAI SDK create() mocks."""
-    from openai.types.chat import ChatCompletion, ChatCompletionMessage
-    from openai.types.chat.chat_completion import Choice
-    from openai.types.completion_usage import CompletionUsage
+def _raw_text_delta(text: str):
+    """A real Anthropic content_block_delta event carrying a text fragment."""
+    from anthropic.types import RawContentBlockDeltaEvent, TextDelta
 
-    return ChatCompletion(
-        id="chatcmpl-test",
-        created=1,
-        model="gpt-4o",
-        object="chat.completion",
-        choices=[
-            Choice(
-                finish_reason="stop",
-                index=0,
-                message=ChatCompletionMessage(role="assistant", content=text),
-            )
-        ],
-        usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    return RawContentBlockDeltaEvent(
+        type="content_block_delta",
+        index=0,
+        delta=TextDelta(type="text_delta", text=text),
     )
 
 
 # ---------------------------------------------------------------------------
 # AnthropicProvider tests
 # ---------------------------------------------------------------------------
+
 
 class TestAnthropicProviderInstantiation:
     """Tests for AnthropicProvider instantiation."""
@@ -71,6 +63,7 @@ class TestAnthropicProviderInstantiation:
 
     def test_has_adapter(self):
         from sanityops_agent.llm.adapters.anthropic_adapter import AnthropicAdapter
+
         provider = AnthropicProvider(api_key="sk-ant")
         assert isinstance(provider.adapter, AnthropicAdapter)
 
@@ -83,15 +76,23 @@ class TestAnthropicProviderCreate:
         provider = AnthropicProvider(api_key="sk-ant")
 
         from anthropic.types import Message as AnthropicMessage
-        mock_message = AnthropicMessage.model_validate({
-            "id": "msg_test",
-            "type": "message",
-            "model": "claude-sonnet-4-20250514",
-            "role": "assistant",
-            "content": [{"type": "text", "text": "Hello, world!"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
-        })
+
+        mock_message = AnthropicMessage.model_validate(
+            {
+                "id": "msg_test",
+                "type": "message",
+                "model": "claude-sonnet-4-20250514",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello, world!"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            }
+        )
 
         async def fake_create(**kwargs):
             return mock_message
@@ -102,7 +103,7 @@ class TestAnthropicProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            result = await provider.create(messages)
+            result = await provider.create(messages, max_tokens=128)
 
         assert isinstance(result, LLMResponse)
         assert result.model == "claude-sonnet-4-20250514"
@@ -113,8 +114,11 @@ class TestAnthropicProviderCreate:
         provider = AnthropicProvider(api_key="sk-ant")
 
         import anthropic
+
         resp = _make_httpx_response(401, {"error": {"type": "authentication_error"}})
-        err = anthropic.AuthenticationError(message="Invalid key", response=resp, body={})
+        err = anthropic.AuthenticationError(
+            message="Invalid key", response=resp, body={}
+        )
 
         async def fake_create(**kwargs):
             raise err
@@ -126,15 +130,41 @@ class TestAnthropicProviderCreate:
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
             from sanityops_agent.llm.exceptions import AuthenticationError
+
             with pytest.raises(AuthenticationError):
-                await provider.create(messages)
+                await provider.create(messages, max_tokens=128)
 
     @pytest.mark.asyncio
-    async def test_create_uses_default_max_tokens(self):
+    async def test_create_propagates_retry_after(self):
+        provider = AnthropicProvider(api_key="sk-ant")
+
+        import anthropic
+
+        resp = _make_httpx_response(429, {"error": {"type": "rate_limit_error"}})
+        resp.headers["retry-after"] = "5"
+        err = anthropic.RateLimitError(message="Rate limited", response=resp, body={})
+
+        async def fake_create(**kwargs):
+            raise err
+
+        mock_client = MagicMock()
+        mock_client.messages.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            from sanityops_agent.llm.exceptions import RateLimitError
+
+            with pytest.raises(RateLimitError) as exc_info:
+                await provider.create(messages, max_tokens=128)
+            assert exc_info.value.retry_after == 5
+
+    @pytest.mark.asyncio
+    async def test_create_no_extra_body_by_default(self):
         provider = AnthropicProvider(api_key="sk-ant")
         assert provider.extra_body is None
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
@@ -142,7 +172,10 @@ class TestAnthropicProviderCreate:
             mock_msg = MagicMock()
             mock_msg.model = "claude-sonnet-4-20250514"
             mock_msg.stop_reason = "end_turn"
-            mock_msg.content = []
+            mock_block = MagicMock()
+            mock_block.type = "text"
+            mock_block.text = "hello"
+            mock_msg.content = [mock_block]
             mock_msg.usage = None
             mock_msg.model_dump.return_value = {}
             return mock_msg
@@ -153,11 +186,11 @@ class TestAnthropicProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            await provider.create(messages)
+            await provider.create(messages, max_tokens=128)
 
+        assert "thinking" not in passed_kwargs
         assert "extra_body" not in passed_kwargs
-        assert passed_kwargs["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
-        assert passed_kwargs["max_tokens"] == 32768
+        assert passed_kwargs["max_tokens"] == 128
 
     @pytest.mark.asyncio
     async def test_create_respects_init_and_call_max_tokens(self):
@@ -169,7 +202,10 @@ class TestAnthropicProviderCreate:
             mock_msg = MagicMock()
             mock_msg.model = "claude-sonnet-4-20250514"
             mock_msg.stop_reason = "end_turn"
-            mock_msg.content = []
+            mock_block = MagicMock()
+            mock_block.type = "text"
+            mock_block.text = "hello"
+            mock_msg.content = [mock_block]
             mock_msg.usage = None
             mock_msg.model_dump.return_value = {}
             return mock_msg
@@ -191,7 +227,7 @@ class TestAnthropicProviderCreate:
         extra = {"thinking": {"type": "disabled"}}
         provider = AnthropicProvider(api_key="sk-ant", extra_body=extra)
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
@@ -200,7 +236,10 @@ class TestAnthropicProviderCreate:
             mock_msg = MagicMock()
             mock_msg.model = "claude-sonnet-4-20250514"
             mock_msg.stop_reason = "end_turn"
-            mock_msg.content = []
+            mock_block = MagicMock()
+            mock_block.type = "text"
+            mock_block.text = "hello"
+            mock_msg.content = [mock_block]
             mock_msg.usage = None
             mock_msg.model_dump.return_value = {}
             return mock_msg
@@ -211,7 +250,7 @@ class TestAnthropicProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            await provider.create(messages)
+            await provider.create(messages, max_tokens=128)
 
         assert "thinking" not in passed_kwargs
         assert provider.extra_body == {"thinking": {"type": "disabled"}}
@@ -222,7 +261,7 @@ class TestAnthropicProviderCreate:
             api_key="sk-ant", extra_body={"thinking": {"type": "disabled"}}
         )
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
@@ -230,7 +269,10 @@ class TestAnthropicProviderCreate:
             mock_msg = MagicMock()
             mock_msg.model = "claude-sonnet-4-20250514"
             mock_msg.stop_reason = "end_turn"
-            mock_msg.content = []
+            mock_block = MagicMock()
+            mock_block.type = "text"
+            mock_block.text = "hello"
+            mock_msg.content = [mock_block]
             mock_msg.usage = None
             mock_msg.model_dump.return_value = {}
             return mock_msg
@@ -241,12 +283,12 @@ class TestAnthropicProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            await provider.create(messages, extra_body=None)
+            await provider.create(messages, extra_body=None, max_tokens=128)
 
         assert "extra_body" not in passed_kwargs
 
     @pytest.mark.asyncio
-    async def test_create_raises_llm_error_without_retry_on_bad_request(self):
+    async def test_create_raises_llm_error_without_retry_on_bad_request(self, caplog):
         import anthropic
 
         from sanityops_agent.llm.exceptions import LLMError
@@ -271,9 +313,12 @@ class TestAnthropicProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            with pytest.raises(LLMError, match="unsupported thinking"):
-                await provider.create(messages)
+            with pytest.raises(LLMError, match="400") as exc:
+                await provider.create(messages, max_tokens=128)
 
+        assert "unsupported thinking" not in str(exc.value)
+        assert "unsupported thinking" not in caplog.text
+        assert exc.value.__suppress_context__
         assert calls == 1
 
 
@@ -284,33 +329,27 @@ class TestAnthropicProviderStream:
     async def test_stream_yields_chunks(self):
         provider = AnthropicProvider(api_key="sk-ant")
 
-        # Use simple mock objects matching the raw event structure
-        # The adapter handles content_block_delta events, not parsed convenience events
-        class MockDelta:
-            def __init__(self, delta_type, text):
-                self.type = delta_type
-                self.text = text
-
-        class MockEvent:
-            def __init__(self, event_type, index=0, delta=None):
-                self.type = event_type
-                self.index = index
-                self.delta = delta
-
+        # Real streams yield raw content_block_delta events for text. Parsed
+        # convenience events (TextEvent) carry the same payload and are not
+        # handled separately, to avoid emitting every fragment twice.
         events = [
-            MockEvent("content_block_delta", index=0, delta=MockDelta("text_delta", "Hel")),
-            MockEvent("content_block_delta", index=0, delta=MockDelta("text_delta", "lo")),
+            _raw_text_delta("Hel"),
+            _raw_text_delta("lo"),
         ]
 
         class MockStream:
             def __init__(self, evts):
                 self._evts = iter(evts)
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 pass
+
             def __aiter__(self):
                 return self
+
             async def __anext__(self):
                 try:
                     return next(self._evts)
@@ -324,19 +363,20 @@ class TestAnthropicProviderStream:
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
             chunks = []
-            async for chunk in provider.stream(messages):
+            async for chunk in provider.stream(messages, max_tokens=128):
                 chunks.append(chunk)
 
         assert len(chunks) == 2
         assert chunks[0].delta == "Hel"
         assert chunks[1].delta == "lo"
         stream_kwargs = mock_client.messages.stream.call_args.kwargs
-        assert stream_kwargs["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
+        assert stream_kwargs["max_tokens"] == 128
 
 
 # ---------------------------------------------------------------------------
 # OpenAIProvider tests
 # ---------------------------------------------------------------------------
+
 
 class TestOpenAIProviderInstantiation:
     """Tests for OpenAIProvider instantiation."""
@@ -360,6 +400,7 @@ class TestOpenAIProviderInstantiation:
 
     def test_has_adapter(self):
         from sanityops_agent.llm.adapters.openai_adapter import OpenAIAdapter
+
         provider = OpenAIProvider(api_key="sk-123")
         assert isinstance(provider.adapter, OpenAIAdapter)
 
@@ -390,10 +431,16 @@ class TestOpenAIProviderCreate:
                     ),
                 )
             ],
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            usage=CompletionUsage(
+                prompt_tokens=10, completion_tokens=5, total_tokens=15
+            ),
         )
 
+        passed_kwargs = {}
+
         async def fake_create(**kwargs):
+            nonlocal passed_kwargs
+            passed_kwargs = kwargs
             return mock_completion
 
         mock_client = MagicMock()
@@ -406,14 +453,18 @@ class TestOpenAIProviderCreate:
 
         assert isinstance(result, LLMResponse)
         assert result.model == "gpt-4o"
+        assert "max_tokens" not in passed_kwargs
 
     @pytest.mark.asyncio
     async def test_create_raises_on_auth_error(self):
         provider = OpenAIProvider(api_key="sk-123")
 
         import openai
+
         resp = _make_httpx_response(401, {"error": {"message": "Invalid API key"}})
-        err = openai.AuthenticationError(message="Invalid key", response=resp, body=None)
+        err = openai.AuthenticationError(
+            message="Invalid key", response=resp, body=None
+        )
 
         async def fake_create(**kwargs):
             raise err
@@ -425,20 +476,55 @@ class TestOpenAIProviderCreate:
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
             from sanityops_agent.llm.exceptions import AuthenticationError
+
             with pytest.raises(AuthenticationError):
                 await provider.create(messages)
+
+    @pytest.mark.asyncio
+    async def test_create_propagates_retry_after(self):
+        provider = OpenAIProvider(api_key="sk-123")
+
+        import openai
+
+        resp = _make_httpx_response(429, {"error": {"message": "Rate limited"}})
+        resp.headers["retry-after"] = "5"
+        err = openai.RateLimitError(message="Rate limited", response=resp, body=None)
+
+        async def fake_create(**kwargs):
+            raise err
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = fake_create
+        mock_client.is_closed = False
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+            from sanityops_agent.llm.exceptions import RateLimitError
+
+            with pytest.raises(RateLimitError) as exc_info:
+                await provider.create(messages)
+            assert exc_info.value.retry_after == 5
 
     @pytest.mark.asyncio
     async def test_create_no_extra_body_by_default(self):
         provider = OpenAIProvider(api_key="sk-123")
         assert provider.extra_body is None
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
             passed_kwargs = kwargs
-            return _make_chat_completion()
+            mock_resp = MagicMock()
+            mock_choice = MagicMock()
+            mock_choice.finish_reason = "stop"
+            mock_choice.message.content = "hello"
+            mock_choice.message.tool_calls = None
+            mock_resp.choices = [mock_choice]
+            mock_resp.usage = None
+            mock_resp.model = "gpt-4o"
+            mock_resp.model_dump.return_value = {}
+            return mock_resp
 
         mock_client = MagicMock()
         mock_client.chat.completions.create = fake_create
@@ -449,7 +535,6 @@ class TestOpenAIProviderCreate:
             await provider.create(messages)
 
         assert "extra_body" not in passed_kwargs
-        assert "max_tokens" not in passed_kwargs
 
     @pytest.mark.asyncio
     async def test_create_forwards_extra_body(self):
@@ -457,13 +542,21 @@ class TestOpenAIProviderCreate:
             api_key="sk-123", extra_body={"thinking": {"type": "disabled"}}
         )
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
             passed_kwargs = kwargs
-            passed_kwargs["extra_body"]["thinking"]["type"] = "mutated"
-            return _make_chat_completion()
+            mock_resp = MagicMock()
+            mock_choice = MagicMock()
+            mock_choice.finish_reason = "stop"
+            mock_choice.message.content = "hello"
+            mock_choice.message.tool_calls = None
+            mock_resp.choices = [mock_choice]
+            mock_resp.usage = None
+            mock_resp.model = "gpt-4o"
+            mock_resp.model_dump.return_value = {}
+            return mock_resp
 
         mock_client = MagicMock()
         mock_client.chat.completions.create = fake_create
@@ -473,20 +566,27 @@ class TestOpenAIProviderCreate:
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
             await provider.create(messages)
 
-        assert "extra_body" in passed_kwargs
-        # Mutating the per-call copy must not touch the provider default.
-        assert provider.extra_body == {"thinking": {"type": "disabled"}}
+        assert passed_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
 
     @pytest.mark.asyncio
     async def test_create_call_override_extra_body(self):
         provider = OpenAIProvider(api_key="sk-123", extra_body={"custom": 1})
 
-        passed_kwargs: dict = {}
+        passed_kwargs = {}
 
         async def fake_create(**kwargs):
             nonlocal passed_kwargs
             passed_kwargs = kwargs
-            return _make_chat_completion()
+            mock_resp = MagicMock()
+            mock_choice = MagicMock()
+            mock_choice.finish_reason = "stop"
+            mock_choice.message.content = "hello"
+            mock_choice.message.tool_calls = None
+            mock_resp.choices = [mock_choice]
+            mock_resp.usage = None
+            mock_resp.model = "gpt-4o"
+            mock_resp.model_dump.return_value = {}
+            return mock_resp
 
         mock_client = MagicMock()
         mock_client.chat.completions.create = fake_create
@@ -501,7 +601,7 @@ class TestOpenAIProviderCreate:
         assert passed_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
 
     @pytest.mark.asyncio
-    async def test_create_raises_llm_error_without_retry_on_bad_request(self):
+    async def test_create_raises_llm_error_without_retry_on_bad_request(self, caplog):
         import openai
 
         from sanityops_agent.llm.exceptions import LLMError
@@ -524,9 +624,12 @@ class TestOpenAIProviderCreate:
 
         with patch.object(provider, "_get_client", return_value=mock_client):
             messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
-            with pytest.raises(LLMError, match="bad extra_body"):
+            with pytest.raises(LLMError, match="400") as exc:
                 await provider.create(messages)
 
+        assert "bad extra_body" not in str(exc.value)
+        assert "bad extra_body" not in caplog.text
+        assert exc.value.__suppress_context__
         assert calls == 1
 
 
@@ -623,7 +726,9 @@ class TestOpenAIProviderStream:
         messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
 
         chunks = []
-        with pytest.raises(RuntimeError, match="stream interrupted"):
+        from sanityops_agent.llm.exceptions import LLMError
+
+        with pytest.raises(LLMError, match="OpenAI request failed"):
             async for chunk in provider.stream(messages):
                 chunks.append(chunk)
 
@@ -660,6 +765,7 @@ class TestOpenAIProviderStream:
 # RuntimeError: Event loop is closed").  The mocks used elsewhere in this file
 # set ``is_closed`` as a plain attribute, which hides this bug; these tests use
 # a method-style fake matching the real SDK clients.
+
 
 class _MethodStyleSdkClient:
     """Fake SDK client whose ``is_closed`` is a method (like the real
@@ -745,7 +851,7 @@ async def test_close_closes_method_style_client(provider_cls):
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES, ids=["openai", "anthropic"])
 @pytest.mark.asyncio
-async def test_close_is_best_effort_when_client_close_raises(provider_cls):
+async def test_close_is_best_effort_when_client_close_raises(provider_cls, caplog):
     """provider.close() must not raise when the SDK client's close() fails.
 
     close() is best-effort: an error from the underlying client must not
@@ -754,6 +860,8 @@ async def test_close_is_best_effort_when_client_close_raises(provider_cls):
     provider = provider_cls(api_key="sk-test")
     provider._client = _RaisingCloseClient()
     await provider.close()  # must not raise
+    assert "transport failed to close" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
     assert provider._client is None, "provider.close() must clear its reference"
 
 
@@ -824,6 +932,7 @@ async def test_get_client_creates_fresh_after_close(provider_cls, monkeypatch):
 # ProviderFactory integration tests
 # ---------------------------------------------------------------------------
 
+
 class TestProviderFactoryIntegration:
     """Tests for ProviderFactory with concrete providers."""
 
@@ -836,9 +945,15 @@ class TestProviderFactoryIntegration:
         ProviderFactory._registry.pop("anthropic", None)
         ProviderFactory._registry.pop("openai", None)
 
-    def _make_config(self, provider: str = "anthropic", api_key: str = "sk-test",
-                     base_url: str | None = None, model: str = "default-model"):
+    def _make_config(
+        self,
+        provider: str = "anthropic",
+        api_key: str = "sk-test",
+        base_url: str | None = None,
+        model: str = "default-model",
+    ):
         from sanityops_agent.config import ProviderConfig
+
         return ProviderConfig(
             PROVIDER=provider,
             API_KEY=api_key,
@@ -847,14 +962,18 @@ class TestProviderFactoryIntegration:
         )
 
     def test_factory_creates_anthropic_provider(self):
-        config = self._make_config(provider="anthropic", api_key="sk-ant", model="claude-test")
+        config = self._make_config(
+            provider="anthropic", api_key="sk-ant", model="claude-test"
+        )
         provider = ProviderFactory.create(config)
         assert isinstance(provider, AnthropicProvider)
         assert provider.api_key == "sk-ant"
         assert provider.model == "claude-test"
 
     def test_factory_creates_openai_provider(self):
-        config = self._make_config(provider="openai", api_key="sk-oai", model="gpt-4o-mini")
+        config = self._make_config(
+            provider="openai", api_key="sk-oai", model="gpt-4o-mini"
+        )
         provider = ProviderFactory.create(config)
         assert isinstance(provider, OpenAIProvider)
         assert provider.api_key == "sk-oai"
@@ -867,6 +986,7 @@ class TestProviderFactoryIntegration:
 
     def test_factory_anthropic_has_correct_default_base_url(self):
         from sanityops_agent.config import ProviderConfig
+
         config = ProviderConfig(PROVIDER="anthropic", API_KEY="sk-ant")
         provider = ProviderFactory.create(config)
         assert isinstance(provider, AnthropicProvider)
@@ -874,24 +994,27 @@ class TestProviderFactoryIntegration:
 
     def test_factory_openai_has_correct_default_base_url(self):
         from sanityops_agent.config import ProviderConfig
+
         config = ProviderConfig(PROVIDER="openai", API_KEY="sk-oai")
         provider = ProviderFactory.create(config)
         assert isinstance(provider, OpenAIProvider)
         assert provider.base_url is None
 
 
-# ---------------------------------------------------------------------------
 # GeminiProvider tests
 # ---------------------------------------------------------------------------
+
 
 class TestGeminiProviderInstantiation:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter()
 
     def test_can_be_instantiated_with_defaults(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(api_key="test-key")
         assert provider.api_key == "test-key"
         assert provider.model == "gemini-3.5-flash-lite"
@@ -899,6 +1022,7 @@ class TestGeminiProviderInstantiation:
 
     def test_can_be_instantiated_with_vertex_ai_config(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(
             api_key="test-key",
             project_id="my-project",
@@ -909,6 +1033,7 @@ class TestGeminiProviderInstantiation:
 
     def test_thinking_config(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(
             api_key="test-key",
             thinking_budget=2048,
@@ -946,6 +1071,7 @@ class TestGeminiProviderClose:
     @pytest.mark.asyncio
     async def test_close_closes_async_client_and_clears_reference(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(api_key="k")
         client = _FakeGeminiClient()
         provider._client = client
@@ -956,6 +1082,7 @@ class TestGeminiProviderClose:
     @pytest.mark.asyncio
     async def test_close_is_best_effort_when_aclose_raises(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(api_key="k")
         provider._client = _RaisingGeminiClient()
         await provider.close()  # must not raise
@@ -964,6 +1091,7 @@ class TestGeminiProviderClose:
     @pytest.mark.asyncio
     async def test_close_is_noop_when_no_client(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         provider = GeminiProvider(api_key="k")
         await provider.close()  # must not raise
         assert provider._client is None
@@ -973,6 +1101,7 @@ class TestGeminiProviderCreate:
     @pytest.fixture
     def provider(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         return GeminiProvider(api_key="test-key")
 
     @pytest.mark.asyncio
@@ -984,12 +1113,12 @@ class TestGeminiProviderCreate:
         # Mock the SDK response with a real dict from model_dump(by_alias=True)
         mock_response = MagicMock()
         mock_response.model_dump.return_value = {
-            "candidates": [{
-                "content": {
-                    "parts": [{"text": "Hello, world!"}]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Hello, world!"}]},
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-3.5-flash-lite",
             "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
         }
@@ -1018,7 +1147,9 @@ class TestGeminiProviderCreate:
 
         mock_response = MagicMock()
         mock_response.model_dump.return_value = {
-            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+            "candidates": [
+                {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+            ],
             "modelVersion": "gemini-3.5-flash-lite",
         }
 
@@ -1039,6 +1170,7 @@ class TestGeminiProviderStream:
     @pytest.fixture
     def provider(self):
         from sanityops_agent.llm.providers.gemini import GeminiProvider
+
         return GeminiProvider(api_key="test-key")
 
     @pytest.mark.asyncio
@@ -1053,11 +1185,7 @@ class TestGeminiProviderStream:
                 self._text = text
 
             def model_dump(self, **kwargs):
-                return {
-                    "candidates": [{
-                        "content": {"parts": [{"text": self._text}]}
-                    }]
-                }
+                return {"candidates": [{"content": {"parts": [{"text": self._text}]}}]}
 
         chunks = [MockChunk("Hel"), MockChunk("lo")]
 

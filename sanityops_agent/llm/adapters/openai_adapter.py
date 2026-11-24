@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from sanityops_agent.core.message import (
     ContentType,
-    FinishReason,
     Message,
     Role,
     StreamChunk,
@@ -17,32 +17,78 @@ from sanityops_agent.core.message import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from sanityops_agent.llm.adapters.base import MessageAdapter, merge_consecutive_messages
-from sanityops_agent.llm.base import LLMResponse
-from sanityops_agent.llm.exceptions import (
-    AuthenticationError,
-    ContextWindowExceededError,
-    LLMError,
-    ProviderUnavailableError,
-    RateLimitError,
-    extract_retry_after,
+from sanityops_agent.llm.adapters.base import (
+    MessageAdapter,
+    map_sdk_error,
+    merge_consecutive_messages,
 )
+from sanityops_agent.llm.base import LLMResponse, normalize_usage
+from sanityops_agent.llm.exceptions import (
+    LLMError,
+)
+from sanityops_agent.llm.stream import parse_tool_arguments
 
 logger = logging.getLogger(__name__)
 
 
-def _dump_tool_input(tool_name: str, tool_input: dict) -> str:
+def _dump_tool_input(tool_input: dict) -> str:
     """Serialize tool arguments; a non-JSON-serializable input is stringified
     rather than raising mid-conversation."""
     try:
         return json.dumps(tool_input)
     except (TypeError, ValueError):
-        logger.warning(
-            "Tool input for %r is not JSON-serializable; wrapping as "
-            '{"raw": <str(input)>}',
-            tool_name,
-        )
+        logger.warning("Tool input is not JSON-serializable; stringifying")
         return json.dumps({"raw": str(tool_input)})
+
+
+def _check_strict_schema(schema: dict, tool_name: str) -> None:
+    """Check object constraints in schema positions, including local definitions."""
+
+    unsupported = {
+        "allOf",
+        "oneOf",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+    }
+
+    def visit(node: dict) -> None:
+        if disallowed := (unsupported & node.keys()):
+            keys = ", ".join(sorted(disallowed))
+            raise ValueError(
+                f"Strict tool {tool_name} uses unsupported schema keywords: {keys}"
+            )
+        kind = node.get("type")
+        is_object = kind == "object" or isinstance(kind, list) and "object" in kind
+        if is_object or "properties" in node:
+            properties = node.get("properties", {})
+            required = node.get("required", [])
+            if (
+                node.get("additionalProperties") is not False
+                or not isinstance(properties, dict)
+                or not isinstance(required, list)
+                or not all(isinstance(key, str) for key in required)
+                or set(required) != set(properties)
+            ):
+                raise ValueError(
+                    f"Strict tool {tool_name} requires all object fields and additionalProperties=false"
+                )
+        for key in ("properties", "$defs", "definitions", "patternProperties"):
+            for child in node.get(key, {}).values():
+                if isinstance(child, dict):
+                    visit(child)
+        for key in ("items", "anyOf", "prefixItems"):
+            children = node.get(key, [])
+            for child in children if isinstance(children, list) else [children]:
+                if isinstance(child, dict):
+                    visit(child)
+
+    if schema.get("type") != "object" or "anyOf" in schema:
+        raise ValueError(f"Strict tool {tool_name} requires a root object")
+    visit(schema)
 
 
 class OpenAIAdapter(MessageAdapter):
@@ -107,12 +153,10 @@ class OpenAIAdapter(MessageAdapter):
                     content_parts.append({"type": "text", "text": t.text})
 
                 # A message with no convertible content must not be emitted as an
-                # assistant turn: {"role":"assistant","content":""} (or null)
-                # with no tool_calls is an invalid shell between the assistant
-                # turn carrying tool_calls and the tool results answering them
-                # — the API rejects that sequence. The tool messages extracted
-                # above are already appended, so skipping the shell loses
-                # nothing.
+                # assistant turn: {"role":"assistant","content":""} with no
+                # tool_calls sits invalidly between tool_calls and its results.
+                # The tool messages extracted above are already appended, so
+                # skipping the assistant shell loses nothing.
                 if not content_parts and not tool_calls:
                     continue
 
@@ -125,9 +169,7 @@ class OpenAIAdapter(MessageAdapter):
                             "type": "function",
                             "function": {
                                 "name": tc.tool_name,
-                                "arguments": _dump_tool_input(
-                                    tc.tool_name, tc.tool_input
-                                ),
+                                "arguments": _dump_tool_input(tc.tool_input),
                             },
                         }
                         for tc in tool_calls
@@ -227,28 +269,33 @@ class OpenAIAdapter(MessageAdapter):
         return output
 
     def tools_to_provider(self, tools: list[ToolDefinition]) -> list[dict]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": {
-                        **(t.input_schema or {}),
-                        # A schema may declare additionalProperties itself;
-                        # otherwise strict-mode compatibility defaults it off.
-                        "additionalProperties": (t.input_schema or {}).get(
-                            "additionalProperties",
-                            (t.provider_config or {}).get(
-                                "additionalProperties", False
-                            ),
-                        ),
+        result = []
+        for tool in tools:
+            config = tool.provider_config or {}
+            schema = dict(tool.input_schema or {})
+            strict = config.get("strict", False)
+            if type(strict) is not bool:
+                raise ValueError(f"Tool {tool.name} requires a boolean strict setting")
+            if "additionalProperties" in config:
+                schema.setdefault(
+                    "additionalProperties", config["additionalProperties"]
+                )
+            if strict:
+                _check_strict_schema(schema, tool.name)
+            else:
+                schema.setdefault("additionalProperties", False)
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": schema,
+                        "strict": strict,
                     },
-                    "strict": (t.provider_config or {}).get("strict", True),
-                },
-            }
-            for t in tools
-        ]
+                }
+            )
+        return result
 
     def from_provider_response(self, raw: dict) -> LLMResponse:
         choice = raw.get("choices", [{}])[0]
@@ -261,13 +308,12 @@ class OpenAIAdapter(MessageAdapter):
         if text:
             content.append(TextBlock(text=text))
 
-        tool_calls = message.get("tool_calls", [])
+        tool_calls = message.get("tool_calls") or []
         for tc in tool_calls:
             fn = tc.get("function", {})
-            try:
-                arguments = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                arguments = {}
+            if tc.get("type", "function") != "function":
+                continue
+            arguments = parse_tool_arguments(fn.get("arguments"), tc.get("id", ""))
             content.append(
                 ToolUseBlock(
                     tool_call_id=tc.get("id", ""),
@@ -281,56 +327,40 @@ class OpenAIAdapter(MessageAdapter):
             content=content,
             stop_reason=finish_reason,
             model=raw.get("model", "unknown"),
-            provider="openai",
-            usage=dict(usage) if usage else {},
+            usage=normalize_usage(usage),
             raw_response=raw,
         )
 
     def from_provider_chunk(self, raw: dict) -> StreamChunk | None:
-        choices = raw.get("choices", [])
-        if not choices:
-            # Usage-only chunk (include_usage=True) — no content to yield
-            return None
-        choice = choices[0]
-        delta = choice.get("delta", {})
-        finish_reason = self._map_stop_reason(choice.get("finish_reason"))
+        return next(self.from_provider_chunks(raw), None)
 
-        # Check for tool call delta first
-        tool_calls = delta.get("tool_calls", [])
-        if tool_calls:
-            tc = tool_calls[0]
-            fn = tc.get("function", {})
-            return StreamChunk(
-                type=ContentType.TOOL_USE,
-                delta={"name": fn.get("name", ""), "arguments": fn.get("arguments", "")},
-                tool_call_id=tc.get("id"),
-                index=tc.get("index", 0) or 0,
-            )
-
-        # Thinking/reasoning content (some OpenAI-compatible APIs send it)
-        thinking = delta.get("reasoning_content") or delta.get("reasoning")
-        if thinking is not None and thinking != "":
-            return StreamChunk(
-                type=ContentType.THINKING,
-                delta=thinking,
-            )
-
-        text = delta.get("content")
-        if text is not None and text != "":
-            return StreamChunk(
-                type=ContentType.TEXT,
-                delta=text,
-            )
-
-        # If only finish reason, emit it
-        if finish_reason != FinishReason.END_TURN:
-            return StreamChunk(
-                type=ContentType.TEXT,
-                delta=None,
-                finish_reason=finish_reason,
-            )
-
-        return None
+    def from_provider_chunks(self, raw: dict) -> Iterator[StreamChunk]:
+        choices = raw.get("choices") or []
+        if choices:
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            thinking = delta.get("reasoning_content") or delta.get("reasoning")
+            if thinking:
+                yield StreamChunk(ContentType.THINKING, delta=thinking)
+            if delta.get("content"):
+                yield StreamChunk(ContentType.TEXT, delta=delta["content"])
+            for call in delta.get("tool_calls") or []:
+                index = call.get("index")
+                if type(index) is not int or index < 0:
+                    raise LLMError("OpenAI streamed a tool call without a valid index")
+                yield StreamChunk(
+                    ContentType.TOOL_USE,
+                    delta=call.get("function") or {},
+                    tool_call_id=call.get("id"),
+                    index=index,
+                )
+            if choice.get("finish_reason") is not None:
+                yield StreamChunk(
+                    ContentType.TEXT,
+                    finish_reason=self._map_stop_reason(choice["finish_reason"]),
+                )
+        if raw.get("usage"):
+            yield StreamChunk(ContentType.TEXT, usage=raw["usage"])
 
     @staticmethod
     def _map_role(role: Role) -> str:
@@ -343,128 +373,18 @@ class OpenAIAdapter(MessageAdapter):
         return mapping.get(role, "user")
 
     @staticmethod
-    def map_exception(exception: Exception) -> Exception:
-        """Map provider-specific exceptions to internal LLMError types."""
-        exc_type_name = type(exception).__name__
-        msg = str(exception).lower()
-
-        if exc_type_name in ("AuthenticationError",):
-            err: LLMError = AuthenticationError(str(exception))
-            err.recoverable = False
-            return err
-        if exc_type_name in ("RateLimitError",):
-            err = RateLimitError(
-                str(exception),
-                retry_after=extract_retry_after(exception),
-            )
-            err.recoverable = True
-            return err
-        if exc_type_name in ("APIError", "APIConnectionError"):
-            return ProviderUnavailableError(str(exception))
-        if exc_type_name in ("BadRequestError",):
-            # Prefer a structural signal (HTTP 400) alongside the message
-            # keywords, which providers change freely.
-            status = getattr(getattr(exception, "response", None), "status_code", None)
-            if status is None or status == 400:
-                context_window = (
-                    "context" in msg and ("exceed" in msg or "too_long" in msg)
-                ) or ("maximum context" in msg)
-                if context_window:
-                    return ContextWindowExceededError(str(exception))
-        return LLMError(str(exception))
+    def map_exception(exception: Exception) -> LLMError:
+        return map_sdk_error(exception, "OpenAI")
 
     def from_sdk_response(self, response: ChatCompletion) -> LLMResponse:
         """Convert OpenAI SDK ChatCompletion to LLMResponse."""
-        choice = response.choices[0]
-        finish_reason = self._map_stop_reason(choice.finish_reason)
+        return self.from_provider_response(response.model_dump())
 
-        message = choice.message
-        content: list = []
-
-        if message.content:
-            content.append(TextBlock(text=message.content))
-
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                if tc.type != "function":
-                    continue
-                try:
-                    arguments = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                content.append(
-                    ToolUseBlock(
-                        tool_call_id=tc.id or "",
-                        tool_name=tc.function.name or "",
-                        tool_input=arguments,
-                    )
-                )
-
-        usage = response.usage.model_dump() if response.usage else {}
-        return LLMResponse(
-            content=content,
-            stop_reason=finish_reason,
-            model=response.model or "unknown",
-            provider="openai",
-            usage=usage,
-            raw_response=response.model_dump(),
-        )
+    def from_sdk_stream_events(
+        self, chunk: ChatCompletionChunk
+    ) -> Iterator[StreamChunk]:
+        """Yield each semantic part of an SDK event without dropping siblings."""
+        return self.from_provider_chunks(chunk.model_dump(exclude_none=True))
 
     def from_sdk_stream_event(self, chunk: ChatCompletionChunk) -> StreamChunk | None:
-        """Convert OpenAI SDK ChatCompletionChunk to StreamChunk."""
-        choices = chunk.choices
-        if not choices:
-            return None
-
-        choice = choices[0]
-        delta = choice.delta
-        finish_reason = self._map_stop_reason(choice.finish_reason)
-
-        # Tool call delta
-        if delta.tool_calls:
-            tc = delta.tool_calls[0]
-            fn = tc.function
-            # The index identifies which tool call this fragment belongs to, so
-            # a consumer can buffer several parallel calls. tc.index is always
-            # set by the API; fall back to 0 for hand-built chunks.
-            index = tc.index if tc.index is not None else 0
-            if fn is not None:
-                return StreamChunk(
-                    type=ContentType.TOOL_USE,
-                    delta={"name": fn.name or "", "arguments": fn.arguments or ""},
-                    tool_call_id=tc.id,
-                    index=index,
-                )
-            return StreamChunk(
-                type=ContentType.TOOL_USE,
-                delta={},
-                tool_call_id=tc.id,
-                index=index,
-            )
-
-        # Thinking/reasoning content
-        reasoning = getattr(delta, "reasoning_content", None) or getattr(
-            delta, "reasoning", None
-        )
-        if reasoning is not None and reasoning != "":
-            return StreamChunk(
-                type=ContentType.THINKING,
-                delta=reasoning,
-            )
-
-        # Text delta
-        if delta.content is not None and delta.content != "":
-            return StreamChunk(
-                type=ContentType.TEXT,
-                delta=delta.content,
-            )
-
-        # Finish reason only
-        if finish_reason != FinishReason.END_TURN:
-            return StreamChunk(
-                type=ContentType.TEXT,
-                delta=None,
-                finish_reason=finish_reason,
-            )
-
-        return None
+        return next(self.from_sdk_stream_events(chunk), None)

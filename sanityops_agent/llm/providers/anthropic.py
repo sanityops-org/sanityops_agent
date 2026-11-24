@@ -8,17 +8,7 @@ from anthropic import (
     APIConnectionError as AnthropicAPIConnectionError,
 )
 from anthropic import (
-    APIStatusError as AnthropicAPIStatusError,
-)
-from anthropic import (
     AsyncAnthropic,
-    BadRequestError,
-)
-from anthropic import (
-    AuthenticationError as AnthropicAuthError,
-)
-from anthropic import (
-    RateLimitError as AnthropicRateLimit,
 )
 
 from sanityops_agent.core.message import (
@@ -27,15 +17,13 @@ from sanityops_agent.core.message import (
     ToolDefinition,
 )
 from sanityops_agent.llm.adapters.anthropic_adapter import AnthropicAdapter
+from sanityops_agent.llm.adapters.base import (
+    _extract_retry_after as _extract_retry_after,
+)
 from sanityops_agent.llm.base import LLMProvider, LLMResponse, prepare_request_kwargs
 from sanityops_agent.llm.exceptions import (
     APIConnectionError,
-    AuthenticationError,
-    ContextWindowExceededError,
     LLMError,
-    ProviderUnavailableError,
-    RateLimitError,
-    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +51,9 @@ class AnthropicProvider(LLMProvider):
         api_version: str = "2023-06-01",
         timeout: float = 120.0,
         extra_body: dict | None = None,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_tokens: int | None = None,
+        *,
+        follow_redirects: bool = True,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -72,6 +62,7 @@ class AnthropicProvider(LLMProvider):
         self.timeout = timeout
         self.extra_body = extra_body
         self.max_tokens = max_tokens
+        self.follow_redirects = follow_redirects
         self._client: AsyncAnthropic | None = None
         self.adapter = AnthropicAdapter()
 
@@ -87,8 +78,16 @@ class AnthropicProvider(LLMProvider):
         payload = self.adapter.to_provider(messages, tools)
         request_kwargs = self._build_request_kwargs(kwargs)
         max_tokens = request_kwargs.pop("max_tokens", None)
+        extra_body = request_kwargs.get("extra_body", {})
+        extra_limit = extra_body.pop("max_tokens", None)
+        if not extra_body:
+            request_kwargs.pop("extra_body", None)
         if max_tokens is None:
-            max_tokens = self.max_tokens
+            max_tokens = self.max_tokens if extra_limit is None else extra_limit
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError(
+                "Anthropic requires an explicit positive integer max_tokens"
+            )
 
         body: dict = {
             "model": self.model,
@@ -109,12 +108,26 @@ class AnthropicProvider(LLMProvider):
         # cleaned up (that is what is_closed() == True means), so no explicit
         # close here — single-context use, see the class docstring.
         if self._client is None or self._client.is_closed():
-            self._client = AsyncAnthropic(
-                api_key=self.api_key,
-                base_url=self.base_url or self.DEFAULT_BASE_URL,
-                timeout=httpx.Timeout(connect=10.0, read=self.timeout, write=self.timeout, pool=10.0),
-                max_retries=0,
+            timeout = httpx.Timeout(
+                connect=10.0, read=self.timeout, write=self.timeout, pool=10.0
             )
+            if self.follow_redirects:
+                self._client = AsyncAnthropic(
+                    api_key=self.api_key,
+                    base_url=self.base_url or self.DEFAULT_BASE_URL,
+                    timeout=timeout,
+                    max_retries=0,
+                )
+            else:
+                self._client = AsyncAnthropic(
+                    api_key=self.api_key,
+                    base_url=self.base_url or self.DEFAULT_BASE_URL,
+                    timeout=timeout,
+                    max_retries=0,
+                    http_client=httpx.AsyncClient(
+                        follow_redirects=False, trust_env=False, timeout=timeout
+                    ),
+                )
         return self._client
 
     async def close(self):
@@ -125,8 +138,8 @@ class AnthropicProvider(LLMProvider):
         try:
             if self._client is not None and not self._client.is_closed():
                 await self._client.close()
-        except Exception as e:
-            logger.warning("Failed to close LLM client: %s", e, exc_info=True)
+        except Exception:
+            logger.warning("Failed to close Anthropic client")
         finally:
             self._client = None
 
@@ -136,29 +149,19 @@ class AnthropicProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         **kwargs,
     ) -> LLMResponse:
-        client = self._get_client()
         body = self._build_request_body(messages, tools, kwargs)
 
         try:
+            client = self._get_client()
             message = await client.messages.create(**body)
             return self.adapter.from_sdk_response(message)
 
-        except AnthropicAuthError as e:
-            raise AuthenticationError(str(e))
-        except AnthropicRateLimit as e:
-            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
-        except BadRequestError as e:
-            msg = str(e).lower()
-            if "context" in msg or "too_long" in msg:
-                raise ContextWindowExceededError(str(e))
-            logger.warning("Anthropic request failed with BadRequestError: %s", e)
-            raise LLMError(str(e))
-        except AnthropicAPIConnectionError as e:
-            raise APIConnectionError(str(e))
-        except AnthropicAPIStatusError as e:
-            if e.status_code >= 500:
-                raise ProviderUnavailableError(str(e))
-            raise LLMError(str(e))
+        except LLMError:
+            raise
+        except AnthropicAPIConnectionError:
+            raise APIConnectionError("Anthropic connection failed") from None
+        except Exception as exc:
+            raise self.adapter.map_exception(exc) from None
 
     async def stream(
         self,
@@ -166,29 +169,45 @@ class AnthropicProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
-        client = self._get_client()
         body = self._build_request_body(messages, tools, kwargs)
 
         try:
+            client = self._get_client()
+            # message_delta announces the reason, message_stop confirms the message
+            # completed. Never expose a tool-use finish before that confirmation.
+            finish = None
+            open_blocks: set[int] = set()
             async with client.messages.stream(**body) as stream:
                 async for event in stream:
+                    if event.type == "content_block_start":
+                        open_blocks.add(event.index)
+                    elif event.type == "content_block_stop":
+                        open_blocks.discard(event.index)
+                    elif event.type == "message_stop":
+                        if open_blocks:
+                            raise LLMError(
+                                "Anthropic stream ended during a content block"
+                            )
+                        if finish is None:
+                            raise LLMError(
+                                "Anthropic stream ended without a stop reason"
+                            )
+                        yield finish
+                        finish = None
+                        continue
                     chunk = self.adapter.from_sdk_stream_event(event)
-                    if chunk:
+                    if chunk is None:
+                        continue
+                    if chunk.finish_reason is not None:
+                        finish = chunk
+                    else:
                         yield chunk
+            if finish is not None:
+                raise LLMError("Anthropic stream ended before message_stop")
 
-        except AnthropicAuthError as e:
-            raise AuthenticationError(str(e))
-        except AnthropicRateLimit as e:
-            raise RateLimitError(str(e), retry_after=extract_retry_after(e))
-        except BadRequestError as e:
-            msg = str(e).lower()
-            if "context" in msg or "too_long" in msg:
-                raise ContextWindowExceededError(str(e))
-            logger.warning("Anthropic stream failed with BadRequestError: %s", e)
-            raise LLMError(str(e))
-        except AnthropicAPIConnectionError as e:
-            raise APIConnectionError(str(e))
-        except AnthropicAPIStatusError as e:
-            if e.status_code >= 500:
-                raise ProviderUnavailableError(str(e))
-            raise LLMError(str(e))
+        except LLMError:
+            raise
+        except AnthropicAPIConnectionError:
+            raise APIConnectionError("Anthropic connection failed") from None
+        except Exception as exc:
+            raise self.adapter.map_exception(exc) from None

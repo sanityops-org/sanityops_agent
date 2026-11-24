@@ -98,7 +98,13 @@ class TestProviderFactoryRegister:
 class TestProviderFactoryCreate:
     """Tests for ProviderFactory.create()."""
 
-    def _make_config(self, provider: str = "dummy", api_key: str = "sk-test", base_url: str | None = None, model: str = "dummy-model"):
+    def _make_config(
+        self,
+        provider: str = "dummy",
+        api_key: str = "sk-test",
+        base_url: str | None = None,
+        model: str = "dummy-model",
+    ):
         return ProviderConfig(
             PROVIDER=provider,
             API_KEY=api_key,
@@ -109,7 +115,9 @@ class TestProviderFactoryCreate:
     def test_create_returns_correct_provider_instance(self):
         """create() instantiates and returns the registered provider."""
         ProviderFactory.register("dummy", DummyProvider)
-        config = self._make_config(provider="dummy", api_key="key123", model="test-model")
+        config = self._make_config(
+            provider="dummy", api_key="key123", model="test-model"
+        )
         result = ProviderFactory.create(config)
         assert isinstance(result, DummyProvider)
         assert result.api_key == "key123"
@@ -186,55 +194,7 @@ class TestProviderFactoryListProviders:
         assert ProviderFactory.list_providers() == []
 
 
-class TestProviderFactoryGemini:
-    @pytest.fixture(autouse=True)
-    def _setup_registry(self):
-        # Re-register after module-level _clean_registry clears everything
-        from sanityops_agent.llm.providers.gemini import GeminiProvider
-        ProviderFactory.register("gemini", GeminiProvider)
-        yield
-        # Cleanup handled by module-level _clean_registry fixture
-
-    def _make_config(self, **kwargs):
-        from sanityops_agent.config import ProviderConfig
-        defaults = {"PROVIDER": "gemini", "API_KEY": "test-key"}
-        defaults.update(kwargs)
-        return ProviderConfig(**defaults)
-
-    def test_factory_creates_gemini_provider(self):
-        config = self._make_config(MODEL_ID="gemini-3.5-flash-lite")
-        provider = ProviderFactory.create(config)
-        from sanityops_agent.llm.providers.gemini import GeminiProvider
-        assert isinstance(provider, GeminiProvider)
-        assert provider.api_key == "test-key"
-        assert provider.model == "gemini-3.5-flash-lite"
-
-    def test_factory_gemini_with_vertex_ai(self):
-        config = self._make_config(
-            GEMINI_PROJECT_ID="my-project",
-            GEMINI_LOCATION="us-central1",
-        )
-        provider = ProviderFactory.create(config)
-        assert provider.project_id == "my-project"
-        assert provider.location == "us-central1"
-
-    def test_factory_gemini_with_thinking(self):
-        config = self._make_config(
-            GEMINI_THINKING_BUDGET=2048,
-            GEMINI_STORE_THINKING=True,
-        )
-        provider = ProviderFactory.create(config)
-        assert provider.thinking_budget == 2048
-        assert provider.store_thinking is True
-
-    def test_factory_lists_gemini_provider(self):
-        providers = ProviderFactory.list_providers()
-        assert "gemini" in providers
-
-
 class ExtraBodyAwareDummyProvider(DummyProvider):
-    """Provider whose constructor accepts an extra_body default."""
-
     def __init__(
         self,
         api_key: str = "",
@@ -247,11 +207,20 @@ class ExtraBodyAwareDummyProvider(DummyProvider):
 
 
 class TestProviderFactoryExtraBodySupport:
-    """Tests for ProviderConfig EXTRA_BODY and its forwarding to providers."""
+    """Tests for ProviderConfig schema and ProviderFactory extra_body forwarding."""
 
-    def test_provider_config_exposes_extra_body(self):
-        assert "EXTRA_BODY" in ProviderConfig.model_fields
-        assert ProviderConfig().EXTRA_BODY is None
+    def test_provider_config_has_expected_fields(self):
+        assert set(ProviderConfig.model_fields.keys()) == {
+            "PROVIDER",
+            "API_KEY",
+            "BASE_URL",
+            "MODEL_ID",
+            "EXTRA_BODY",
+            "GEMINI_PROJECT_ID",
+            "GEMINI_LOCATION",
+            "GEMINI_THINKING_BUDGET",
+            "GEMINI_STORE_THINKING",
+        }
 
     def test_create_passes_extra_body_to_aware_provider(self):
         ProviderFactory.register("extra_body_dummy", ExtraBodyAwareDummyProvider)
@@ -279,3 +248,52 @@ class TestProviderFactoryExtraBodySupport:
         provider = ProviderFactory.create(config)
         assert isinstance(provider, DummyProvider)
         assert not hasattr(provider, "extra_body")
+
+
+class TestProviderFactoryGemini:
+    @pytest.fixture(autouse=True)
+    def _setup_registry(self):
+        # Re-register after module-level _clean_registry clears everything
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+
+        ProviderFactory.register("gemini", GeminiProvider)
+        yield
+        # Cleanup handled by module-level _clean_registry fixture
+
+    def _make_config(self, **kwargs):
+        from sanityops_agent.config import ProviderConfig
+
+        defaults = {"PROVIDER": "gemini", "API_KEY": "test-key"}
+        defaults.update(kwargs)
+        return ProviderConfig(**defaults)
+
+    def test_factory_creates_gemini_provider(self):
+        config = self._make_config(MODEL_ID="gemini-3.5-flash-lite")
+        provider = ProviderFactory.create(config)
+        from sanityops_agent.llm.providers.gemini import GeminiProvider
+
+        assert isinstance(provider, GeminiProvider)
+        assert provider.api_key == "test-key"
+        assert provider.model == "gemini-3.5-flash-lite"
+
+    def test_factory_gemini_with_vertex_ai(self):
+        config = self._make_config(
+            GEMINI_PROJECT_ID="my-project",
+            GEMINI_LOCATION="us-central1",
+        )
+        provider = ProviderFactory.create(config)
+        assert provider.project_id == "my-project"
+        assert provider.location == "us-central1"
+
+    def test_factory_gemini_with_thinking(self):
+        config = self._make_config(
+            GEMINI_THINKING_BUDGET=2048,
+            GEMINI_STORE_THINKING=True,
+        )
+        provider = ProviderFactory.create(config)
+        assert provider.thinking_budget == 2048
+        assert provider.store_thinking is True
+
+    def test_factory_lists_gemini_provider(self):
+        providers = ProviderFactory.list_providers()
+        assert "gemini" in providers

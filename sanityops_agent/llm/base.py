@@ -19,6 +19,17 @@ from sanityops_agent.core.message import (
 class LLMProvider(ABC):
     """LLM Provider abstract base class - async only, no retry logic"""
 
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str | None = None,
+        model: str = "",
+        **kwargs,
+    ) -> None:
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+
     @abstractmethod
     async def create(
         self,
@@ -30,7 +41,7 @@ class LLMProvider(ABC):
         pass
 
     @abstractmethod
-    async def stream(
+    def stream(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
@@ -72,4 +83,31 @@ def prepare_request_kwargs(
             request_kwargs["extra_body"] = copy.deepcopy(default_extra_body)
     elif not request_kwargs["extra_body"]:
         request_kwargs.pop("extra_body", None)
+    else:
+        request_kwargs["extra_body"] = copy.deepcopy(request_kwargs["extra_body"])
     return request_kwargs
+
+
+def normalize_usage(usage: dict | None) -> dict:
+    """Preserve upstream counters and derive a total only for complete usage."""
+    result = dict(usage or {})
+    if (
+        result.get("input_tokens") is not None
+        and result.get("output_tokens") is not None
+    ):
+        result["total_tokens"] = sum(
+            result.get(key) or 0
+            for key in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+            )
+        )
+    elif (
+        result.get("total_tokens") is None
+        and result.get("prompt_tokens") is not None
+        and result.get("completion_tokens") is not None
+    ):
+        result["total_tokens"] = result["prompt_tokens"] + result["completion_tokens"]
+    return result

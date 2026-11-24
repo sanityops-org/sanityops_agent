@@ -1,6 +1,5 @@
 """Tests for retry logic in the agent framework."""
 
-
 import pytest
 
 from sanityops_agent.core.agent import AgentConfig, BaseAgent, TerminationReason
@@ -35,19 +34,19 @@ class _TestAgent(BaseAgent):
                 raise resp
             return resp
         # After exhausting configured responses, keep returning end_turn with content
-        return LLMResponse(content=[TextBlock(text="done")], stop_reason=FinishReason.END_TURN, model="mock", usage={"total_tokens": 10})
+        return LLMResponse(
+            content=[TextBlock(text="done")],
+            stop_reason=FinishReason.END_TURN,
+            model="mock",
+            usage={"total_tokens": 10},
+        )
 
     async def _execute_tools(self, tool_calls: list) -> None:
         pass
 
 
 class TestAgentRetry:
-    """Test agent-level retry control.
-
-    Note: BaseAgent._call_llm_with_retry only retries recoverable errors
-    (rate limits, network issues, 5xx). Non-recoverable errors (auth,
-    context window) fail immediately without retry.
-    """
+    """Test agent-level retry control."""
 
     @pytest.mark.asyncio
     async def test_retry_succeeds_after_transient_failure(self):
@@ -56,11 +55,18 @@ class TestAgentRetry:
         agent = _TestAgent(config)
 
         # Response must have content to avoid continue in the agent loop
-        success_resp = LLMResponse(content=[TextBlock(text="Success!")], stop_reason=FinishReason.END_TURN, model="mock", usage={"total_tokens": 10})
-        agent.set_responses([
-            RateLimitError("rate limited", retry_after=0.01),
-            success_resp,
-        ])
+        success_resp = LLMResponse(
+            content=[TextBlock(text="Success!")],
+            stop_reason=FinishReason.END_TURN,
+            model="mock",
+            usage={"total_tokens": 10},
+        )
+        agent.set_responses(
+            [
+                RateLimitError("rate limited", retry_after=0.01),
+                success_resp,
+            ]
+        )
         result = await agent.run("test prompt")
         # After rate limit error, retry succeeds with end_turn -> END_TURN
         assert result.termination_reason == TerminationReason.END_TURN
@@ -71,27 +77,100 @@ class TestAgentRetry:
         config = AgentConfig(max_retries=2, max_loops=5)
         agent = _TestAgent(config)
 
-        agent.set_responses([
-            RateLimitError("rate limited", retry_after=0.01),
-            RateLimitError("rate limited", retry_after=0.01),
-        ])
+        agent.set_responses(
+            [
+                RateLimitError("rate limited", retry_after=0.01),
+                RateLimitError("rate limited", retry_after=0.01),
+            ]
+        )
         result = await agent.run("test prompt")
         assert result.termination_reason == TerminationReason.ERROR
 
     @pytest.mark.asyncio
-    async def test_auth_error_fails_immediately(self):
-        """Non-recoverable errors fail immediately without retry."""
+    async def test_auth_error_not_retried(self):
+        """Non-recoverable errors fail immediately, without retrying."""
         config = AgentConfig(max_retries=2, max_loops=5)
         agent = _TestAgent(config)
 
-        agent.set_responses([
-            AuthenticationError("bad auth"),
-            AuthenticationError("bad auth"),
-        ])
+        agent.set_responses(
+            [
+                AuthenticationError("bad auth"),
+                AuthenticationError("bad auth"),
+            ]
+        )
         result = await agent.run("test prompt")
         assert result.termination_reason == TerminationReason.ERROR
-        # Only ONE call was made — no retry for non-recoverable errors
+        # Only the first call was attempted — no retry.
         assert agent._response_index == 1
+        # The recorded error is marked non-recoverable.
+        assert result.error_detail[0].recoverable is False
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_not_retried(self):
+        """A non-LLMError exception (no recoverable attr) is not retried."""
+        config = AgentConfig(max_retries=2, max_loops=5)
+        agent = _TestAgent(config)
+
+        agent.set_responses(
+            [
+                ValueError("boom"),
+                ValueError("boom"),
+            ]
+        )
+        result = await agent.run("test prompt")
+        assert result.termination_reason == TerminationReason.ERROR
+        assert agent._response_index == 1
+
+    def test_retry_after_is_honored(self):
+        """retry_after is used directly, capped at MAX_RETRY_DELAY."""
+
+        agent = _TestAgent(AgentConfig(max_retries=1))
+
+        # Happy path: retry_after=5 -> 5s.
+        err = RateLimitError("rate limited", retry_after=5)
+        assert agent._compute_retry_delay(err, 0) == 5
+
+        # Cap path: retry_after=120 -> capped at 60.
+        err = RateLimitError("rate limited", retry_after=120)
+        assert agent._compute_retry_delay(err, 0) == 60
+
+    def test_retry_after_absents_falls_back_to_backoff(self):
+        """Without retry_after, exponential backoff is used."""
+        agent = _TestAgent(AgentConfig(max_retries=1))
+        err = RateLimitError("rate limited")
+        assert agent._compute_retry_delay(err, 0) == 1
+        assert agent._compute_retry_delay(err, 2) == 4
+
+    @pytest.mark.asyncio
+    async def test_retry_loop_sleeps_retry_after(self, monkeypatch):
+        """The retry loop sleeps the retry_after value, not 2**attempt."""
+        from sanityops_agent.core import agent as agent_module
+
+        config = AgentConfig(max_retries=3, max_loops=5)
+        agent = _TestAgent(config)
+
+        success_resp = LLMResponse(
+            content=[TextBlock(text="Success!")],
+            stop_reason=FinishReason.END_TURN,
+            model="mock",
+            usage={"total_tokens": 10},
+        )
+        agent.set_responses(
+            [
+                RateLimitError("rate limited", retry_after=7),
+                success_resp,
+            ]
+        )
+
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(agent_module.asyncio, "sleep", fake_sleep)
+        await agent.run("test prompt")
+
+        assert sleeps == [7], f"expected sleep(7), got {sleeps}"
 
     def test_llm_error_not_recoverable(self):
         """Base LLMError without status_code is not recoverable by default."""

@@ -1,11 +1,16 @@
 """Integration tests for state persistence."""
 
-
 import pytest
 
 from sanityops_agent.core.context import AgentContext
-from sanityops_agent.core.message import Message, Role
+from sanityops_agent.core.message import (
+    Message,
+    RedactedThinkingBlock,
+    Role,
+    ThinkingBlock,
+)
 from sanityops_agent.managers.state import StateManager
+from sanityops_agent.managers.todo import TodoManager
 
 
 class TestStatePersist:
@@ -53,3 +58,31 @@ class TestStatePersist:
         loaded_ctx = await manager2.load()
 
         assert len(loaded_ctx.messages) == 0
+
+
+async def test_state_keeps_opaque_thinking_fields(tmp_path):
+    manager = StateManager(tmp_path / "state.json")
+    content = [
+        ThinkingBlock("thinking", signature="fixture-signature"),
+        RedactedThinkingBlock("fixture-block"),
+    ]
+    await manager.save(AgentContext(messages=[Message(Role.ASSISTANT, content)]))
+    assert (await manager.load()).messages[0].content == content
+
+
+async def test_managed_state_cannot_be_loaded_for_a_different_session(tmp_path):
+    tmp_path.chmod(0o700)
+    state_path = tmp_path / "managed.json"
+    first = StateManager(state_path, session_id="one")
+    await first.save(
+        AgentContext(messages=[Message.from_text(Role.USER, "Private turn")])
+    )
+
+    with pytest.raises(PermissionError, match="session"):
+        await StateManager(state_path, session_id="two").load()
+
+
+def test_todo_persist_creates_private_state(tmp_path):
+    state_path = tmp_path / "todo.json"
+    TodoManager(state_path).create("Test item")
+    assert state_path.stat().st_mode & 0o777 == 0o600

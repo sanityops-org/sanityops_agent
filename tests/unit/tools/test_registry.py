@@ -92,6 +92,14 @@ class TestRegisterAndGet:
         assert tool.context is ctx
         assert tool.context.get("key") == "shared_value"
 
+    def test_same_tool_instance_cannot_change_registration_context(self):
+        first_registry, second_registry = ToolRegistry(), ToolRegistry()
+        tool = DummyTool(name="sample")
+        first_registry.register(tool)
+        with pytest.raises(ValueError, match="different tool context"):
+            second_registry.register(tool)
+        assert first_registry.get("sample").context is first_registry.context
+
 
 class TestListAll:
     """Test list_all returns all tools."""

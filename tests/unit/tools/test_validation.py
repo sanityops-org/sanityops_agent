@@ -21,7 +21,13 @@ class _ValidatedTool(Tool):
         "required": ["name"],
     }
 
-    async def execute(self, name: str = "", count: int = 0, enabled: bool = False, threshold: float = 0.0) -> ToolResult:
+    async def execute(
+        self,
+        name: str = "",
+        count: int = 0,
+        enabled: bool = False,
+        threshold: float = 0.0,
+    ) -> ToolResult:
         if not name:
             raise ValueError("name is required")
         return ToolResult(content=f"{name}:{count}:{enabled}:{threshold}")

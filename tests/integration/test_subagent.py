@@ -47,7 +47,7 @@ class TestSubAgent:
         provider = MockLLMProvider()
         factory = AgentFactory(provider=provider, tool_registry=registry)
 
-        sub_agent = factory.create_sub_agent(system_prompt="You are a sub-sanityops_agent.")
+        sub_agent = factory.create_sub_agent(system_prompt="You are a sub-agent.")
 
         tool_names = [t.name for t in sub_agent.tool_registry.list_all()]
         assert "common_tool" in tool_names

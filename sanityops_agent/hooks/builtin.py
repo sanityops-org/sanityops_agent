@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # LoggingHook
 # ---------------------------------------------------------------------------
 
+
 class LoggingHook(Hook):
     """Logs agent lifecycle events at appropriate log levels."""
 
@@ -54,11 +55,9 @@ class LoggingHook(Hook):
             if success:
                 logger.info(f"Tool '{tool_name}' completed successfully")
             else:
-                error = data.get("error", "unknown error")
-                logger.error(f"Tool '{tool_name}' failed: {error}")
+                logger.error("Tool '%s' failed", tool_name)
         elif event == HookEvent.ON_ERROR:
-            error = data.get("error", "unknown")
-            logger.error(f"Agent error: {error}")
+            logger.error("Agent error")
         elif event == HookEvent.ON_TERMINATION:
             reason = data.get("reason", "unknown")
             logger.info(f"Agent terminated: {reason}")
@@ -70,9 +69,11 @@ class LoggingHook(Hook):
 # MetricsHook
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class MetricsData:
     """Container for collected metrics."""
+
     total_loops: int = 0
     total_llm_calls: int = 0
     total_tool_calls: int = 0
@@ -113,7 +114,7 @@ class MetricsHook(Hook):
             HookEvent.ON_ERROR,
             HookEvent.ON_TERMINATION,
         ]
-        self._metrics = MetricsData()
+        self._metrics: MetricsData = MetricsData()
 
     async def handle(self, ctx: HookContext) -> HookContext:
         event = ctx.event
@@ -130,7 +131,9 @@ class MetricsHook(Hook):
 
         elif event == HookEvent.AFTER_LLM_CALL:
             if self._metrics._llm_start > 0:
-                self._metrics.llm_duration += time.monotonic() - self._metrics._llm_start
+                self._metrics.llm_duration += (
+                    time.monotonic() - self._metrics._llm_start
+                )
             self._metrics.total_input_tokens += data.get("input_tokens", 0)
             self._metrics.total_output_tokens += data.get("output_tokens", 0)
             self._metrics.total_tokens += data.get("total_tokens", 0)
@@ -138,29 +141,39 @@ class MetricsHook(Hook):
         elif event == HookEvent.BEFORE_TOOL_EXEC:
             self._metrics.total_tool_calls += 1
             tool_name = data.get("tool_name", "unknown")
-            self._metrics.tool_call_counts[tool_name] = \
+            self._metrics.tool_call_counts[tool_name] = (
                 self._metrics.tool_call_counts.get(tool_name, 0) + 1
+            )
             self._metrics._tool_start = time.monotonic()
             self._metrics._tool_name_for_duration = tool_name
 
         elif event == HookEvent.AFTER_TOOL_EXEC:
             tool_name = data.get("tool_name", "")
-            if self._metrics._tool_name_for_duration == tool_name and self._metrics._tool_start > 0:
-                self._metrics.tool_duration += time.monotonic() - self._metrics._tool_start
+            if (
+                self._metrics._tool_name_for_duration == tool_name
+                and self._metrics._tool_start > 0
+            ):
+                self._metrics.tool_duration += (
+                    time.monotonic() - self._metrics._tool_start
+                )
             if not data.get("success", True):
-                self._metrics.tool_error_counts[tool_name] = \
+                self._metrics.tool_error_counts[tool_name] = (
                     self._metrics.tool_error_counts.get(tool_name, 0) + 1
+                )
 
         elif event == HookEvent.ON_ERROR:
             self._metrics.total_errors += 1
             error_type = data.get("error_type", "unknown")
-            self._metrics.error_counts[error_type] = \
+            self._metrics.error_counts[error_type] = (
                 self._metrics.error_counts.get(error_type, 0) + 1
+            )
 
         elif event == HookEvent.ON_TERMINATION:
             self._metrics.end_time = time.monotonic()
             if self._metrics.start_time > 0:
-                self._metrics.total_duration = self._metrics.end_time - self._metrics.start_time
+                self._metrics.total_duration = (
+                    self._metrics.end_time - self._metrics.start_time
+                )
 
         return ctx
 
@@ -172,6 +185,7 @@ class MetricsHook(Hook):
 # ---------------------------------------------------------------------------
 # SafetyCheckHook
 # ---------------------------------------------------------------------------
+
 
 class SafetyCheckHook(Hook):
     """Blocks execution of dangerous tools."""
@@ -206,6 +220,7 @@ class SafetyCheckHook(Hook):
 # DebugHook
 # ---------------------------------------------------------------------------
 
+
 class DebugHook(Hook):
     """Debug hook that logs all events at debug level."""
 
@@ -218,14 +233,14 @@ class DebugHook(Hook):
         self.events = list(HookEvent)
 
     async def handle(self, ctx: HookContext) -> HookContext:
-        event_name = ctx.event.value
-        logger.debug(f"DebugHook: {event_name}, data={ctx.data}")
+        logger.debug("DebugHook: %s, blocked=%s", ctx.event.value, ctx.blocked)
         return ctx
 
 
 # ---------------------------------------------------------------------------
 # RateLimitHandlerHook
 # ---------------------------------------------------------------------------
+
 
 class RateLimitHandlerHook(Hook):
     """Detects rate limit errors and suggests retry delays."""
@@ -235,8 +250,12 @@ class RateLimitHandlerHook(Hook):
     priority = 20
 
     _RATE_LIMIT_KEYWORDS = [
-        "rate_limit", "rate limit", "429", "throttl",
-        "quota exceeded", "too many requests",
+        "rate_limit",
+        "rate limit",
+        "429",
+        "throttl",
+        "quota exceeded",
+        "too many requests",
     ]
 
     def __init__(self, default_retry_delay: float = 60.0):
@@ -247,9 +266,7 @@ class RateLimitHandlerHook(Hook):
     async def handle(self, ctx: HookContext) -> HookContext:
         error_str = str(ctx.data.get("error", "")).lower()
 
-        is_rate_limit = any(
-            kw in error_str for kw in self._RATE_LIMIT_KEYWORDS
-        )
+        is_rate_limit = any(kw in error_str for kw in self._RATE_LIMIT_KEYWORDS)
 
         if is_rate_limit:
             retry_after = ctx.data.get("retry_after")
