@@ -55,6 +55,7 @@ from sanityops_agent.llm.providers.openai import OpenAIProvider
 from sanityops_agent.agents.factory import AgentFactory
 from sanityops_agent.tools.registry import ToolRegistry
 
+
 async def main():
     provider = OpenAIProvider(
         api_key="your-key",  # or set OPENAI_API_KEY env var
@@ -75,6 +76,7 @@ async def main():
 
     await provider.close()
 
+
 asyncio.run(main())
 ```
 
@@ -82,6 +84,7 @@ asyncio.run(main())
 
 ```python
 from sanityops_agent.tools.base import Tool, ToolResult
+
 
 class WeatherTool(Tool):
     name = "get_weather"
@@ -97,6 +100,7 @@ class WeatherTool(Tool):
     async def execute(self, city: str, **kwargs) -> ToolResult:
         # Call weather API here
         return ToolResult(content=f"Sunny, 25°C in {city}")
+
 
 # Register it
 registry = ToolRegistry()
@@ -177,7 +181,7 @@ Supported environment variables:
 | `MODEL` | `gpt-4o-mini` | Model name |
 | `EXTRA_BODY` | *(empty)* | JSON object forwarded to the provider SDK request (Anthropic/OpenAI) |
 | `MAX_LOOPS` | `30` | Max agent loops per run |
-| `MAX_TOKENS` | unset | Max output tokens per request. The example file sets 8000. Anthropic requires an explicit positive limit. |
+| `MAX_TOKENS` | unset | Max output tokens per request; the example file leaves it unset. Anthropic requires an explicit positive limit. |
 | `TOTAL_TIMEOUT` | `300` | Total timeout in seconds |
 | `TEMPERATURE` | `0.7` | Sampling temperature |
 | `SYSTEM_PROMPT` | *(see .env)* | System prompt for the agent |

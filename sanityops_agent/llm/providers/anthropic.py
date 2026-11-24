@@ -84,7 +84,11 @@ class AnthropicProvider(LLMProvider):
             request_kwargs.pop("extra_body", None)
         if max_tokens is None:
             max_tokens = self.max_tokens if extra_limit is None else extra_limit
-        if type(max_tokens) is not int or max_tokens <= 0:
+        if (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or max_tokens <= 0
+        ):
             raise ValueError(
                 "Anthropic requires an explicit positive integer max_tokens"
             )

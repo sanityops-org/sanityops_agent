@@ -2117,3 +2117,44 @@ class TestGeminiAdapterStreamAssembly:
         call = response.get_tool_calls()[0]
         assert call.tool_name == "search"
         assert call.tool_input == {"q": "x"}
+
+
+class TestGeminiAdapterToolArgumentValidation:
+    """Function-call arguments must be JSON objects."""
+
+    @staticmethod
+    def _adapter():
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
+        return GeminiAdapter()
+
+    def test_non_object_arguments_raise(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "search", "args": [1, 2]}}],
+                    }
+                }
+            ]
+        }
+        with pytest.raises(LLMError, match="search"):
+            self._adapter().from_provider_response(raw)
+
+    def test_missing_arguments_default_to_empty_object(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "clock"}}],
+                    }
+                }
+            ]
+        }
+        response = self._adapter().from_provider_response(raw)
+
+        call = response.get_tool_calls()[0]
+        assert call.tool_name == "clock"
+        assert call.tool_input == {}

@@ -291,7 +291,10 @@ class StateManager:
                 elif block_type == ContentType.THINKING.value:
                     blocks.append(
                         ThinkingBlock(
-                            thinking=b.get("thinking", ""), signature=b.get("signature")
+                            thinking=b.get("thinking", ""),
+                            # Older state files store the signature under the
+                            # pre-rename key.
+                            signature=b.get("signature") or b.get("thinking_signature"),
                         )
                     )
                 elif block_type == ContentType.REDACTED_THINKING.value:

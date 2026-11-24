@@ -305,11 +305,19 @@ class GeminiAdapter(MessageAdapter):
                 )
             elif "functionCall" in part:
                 fc = part["functionCall"]
+                arguments = fc.get("args")
+                if arguments is None:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    raise LLMError(
+                        "Expected object arguments for tool call "
+                        f"{fc.get('id') or fc.get('name', '')}"
+                    )
                 content.append(
                     ToolUseBlock(
                         tool_call_id=fc.get("id") or fc.get("name", ""),
                         tool_name=fc.get("name", ""),
-                        tool_input=fc.get("args") or {},
+                        tool_input=arguments,
                         thought_signature=part.get("thoughtSignature"),
                     )
                 )

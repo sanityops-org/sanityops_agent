@@ -482,3 +482,33 @@ class TestStateManagerValidation:
         await manager.save(ctx)
         with pytest.raises(ValueError, match="Cannot resume an unsigned"):
             await manager.load()
+
+
+@pytest.mark.asyncio
+async def test_load_accepts_legacy_thinking_signature_key(tmp_state_path):
+    """State files written before the signature rename still reload intact."""
+    with open(tmp_state_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "provider": "anthropic",
+                        "blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking": "Reasoning",
+                                "thinking_signature": "legacy-sig",
+                            }
+                        ],
+                    }
+                ]
+            },
+            handle,
+        )
+
+    loaded = await StateManager(state_path=tmp_state_path).load()
+
+    block = loaded.messages[0].content[0]
+    assert isinstance(block, ThinkingBlock)
+    assert block.signature == "legacy-sig"

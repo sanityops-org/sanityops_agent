@@ -1241,3 +1241,19 @@ class TestGeminiProviderStream:
         assert len(results) == 2
         assert results[0].delta == "Hel"
         assert results[1].delta == "lo"
+
+
+def test_anthropic_max_tokens_accepts_int_subclass():
+    class Limit(int):
+        pass
+
+    provider = AnthropicProvider(api_key="sk-ant")
+    body = provider._build_request_body([], None, {"max_tokens": Limit(64)})
+
+    assert body["max_tokens"] == 64
+
+
+def test_anthropic_max_tokens_rejects_bool():
+    provider = AnthropicProvider(api_key="sk-ant")
+    with pytest.raises(ValueError, match="positive integer max_tokens"):
+        provider._build_request_body([], None, {"max_tokens": True})
