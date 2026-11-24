@@ -63,8 +63,10 @@ class WorkspacePath:
                     except FileExistsError:
                         pass
                 child = os.open(part, flags, dir_fd=fd)
-                os.close(fd)
-                fd = child
+                # Swap before closing so the finally block can never re-close
+                # an already-closed descriptor if the close itself fails.
+                fd, child = child, fd
+                os.close(child)
             yield fd
         finally:
             os.close(fd)

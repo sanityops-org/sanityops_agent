@@ -53,6 +53,8 @@ class GlobTool(Tool):
     }
     tags = ["file"]
 
+    # The typed parameters mirror the model-facing schema; the base class
+    # accepts generic keyword arguments.
     async def execute(  # type: ignore[override]
         self, pattern: str, path: str | None = None, **kwargs: Any
     ) -> ToolResult:

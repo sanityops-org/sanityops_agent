@@ -57,6 +57,8 @@ class FileOpsTool(Tool):
     tags = ["file"]
     _validator = Draft202012Validator(parameters)
 
+    # The typed parameters mirror the model-facing schema; the base class
+    # accepts generic keyword arguments.
     async def execute(self, operation: str, path: str, **kwargs: Any) -> ToolResult:  # type: ignore[override]
         if operation not in self.parameters["properties"]["operation"]["enum"]:
             return ToolResult("", False, "Unknown operation")
