@@ -1,4 +1,5 @@
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import MagicMock
 
 import pytest
 from anthropic.types import Message as ClaudeMessage
@@ -32,6 +33,12 @@ class LocalStream:
     async def __aiter__(self):
         for event in self.events:
             yield event
+
+    async def iter_lines(self):
+        for event in self.events:
+            raw = event.model_dump(exclude_none=True)
+            yield f"data: {json.dumps(raw)}"
+        yield "data: [DONE]"
 
 
 def function(index, name=None, arguments=None, id=None):
@@ -71,7 +78,9 @@ def openai_stream(events, *, base_url=None):
     stream = LocalStream(events)
     client = MagicMock()
     client.is_closed.return_value = False
-    client.chat.completions.create = AsyncMock(return_value=stream)
+    client.chat.completions.with_streaming_response.create = MagicMock(
+        return_value=stream
+    )
     provider._client = client
     return provider, stream
 
@@ -108,7 +117,7 @@ async def test_collects_parallel_calls_and_final_usage(url, request_usage):
         ToolUseBlock("b", "clock", {}),
     ]
     assert response.usage["total_tokens"] == 9
-    kwargs = provider._client.chat.completions.create.call_args.kwargs
+    kwargs = provider._client.chat.completions.with_streaming_response.create.call_args.kwargs
     assert kwargs.get("stream_options", {}).get("include_usage", False) is request_usage
     assert stream.closed
 

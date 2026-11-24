@@ -1,17 +1,15 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
-from typing import cast
 
 from openai import (
     APIConnectionError as OpenAIAPIConnectionError,
 )
 from openai import (
     AsyncOpenAI,
-    AsyncStream,
 )
-from openai.types.chat import ChatCompletionChunk
 
 from sanityops_agent.core.message import (
     Message,
@@ -148,18 +146,30 @@ class OpenAIProvider(LLMProvider):
 
         try:
             client = self._get_client()
-            stream = await client.chat.completions.create(
+            # Read the response body to EOF rather than stopping at the
+            # "[DONE]" sentinel. The SDK's AsyncStream leaves the underlying
+            # byte-stream generators suspended when it breaks early, and
+            # finalizing them later can raise while the pool is still open.
+            async with client.chat.completions.with_streaming_response.create(
                 model=self.model,
                 messages=payload["messages"],
                 tools=payload.get("tools"),  # type: ignore[arg-type]
                 stream=True,
                 **request_kwargs,
-            )
-            # With stream=True, the return type is AsyncStream[ChatCompletionChunk]
-            # mypy sees a union; we use a cast to narrow the type
-            async with cast(AsyncStream[ChatCompletionChunk], stream) as stream_iter:
-                async for chunk in stream_iter:
-                    for part in self.adapter.from_sdk_stream_events(chunk):
+            ) as response:
+                async for line in response.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line.removeprefix("data:").strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        raw = json.loads(data)
+                    except json.JSONDecodeError:
+                        raise LLMError("OpenAI stream sent invalid JSON") from None
+                    if not isinstance(raw, dict):
+                        raise LLMError("OpenAI stream sent an invalid event")
+                    for part in self.adapter.from_provider_chunks(raw):
                         yield part
 
         except LLMError:

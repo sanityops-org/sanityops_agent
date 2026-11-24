@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 from contextlib import aclosing
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
-from sanityops_agent.core.message import Message, Role, TextBlock
+from sanityops_agent.core.message import FinishReason, Message, Role, TextBlock
 from sanityops_agent.llm.base import LLMResponse
 from sanityops_agent.llm.factory import ProviderFactory
 from sanityops_agent.llm.providers.anthropic import AnthropicProvider
@@ -633,16 +634,15 @@ class TestOpenAIProviderCreate:
         assert calls == 1
 
 
-class _FakeAsyncOpenAIStream:
-    """Minimal AsyncStream test double tracking context-manager cleanup."""
+class _FakeStreamingResponse:
+    """Minimal streaming-response double tracking context-manager cleanup."""
 
-    def __init__(self, items, error_after: int | None = None):
-        self._items = iter(items)
+    def __init__(self, events, error_after: int | None = None):
+        self._events = iter(events)
         self._error_after = error_after
         self._yielded = 0
         self.entered = False
         self.closed = False
-        self.response = MagicMock()
 
     async def __aenter__(self):
         self.entered = True
@@ -651,18 +651,13 @@ class _FakeAsyncOpenAIStream:
     async def __aexit__(self, exc_type, exc, tb):
         self.closed = True
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self._error_after is not None and self._yielded >= self._error_after:
-            raise RuntimeError("stream interrupted")
-        try:
-            item = next(self._items)
-        except StopIteration:
-            raise StopAsyncIteration
-        self._yielded += 1
-        return item
+    async def iter_lines(self):
+        for event in self._events:
+            if self._error_after is not None and self._yielded >= self._error_after:
+                raise RuntimeError("stream interrupted")
+            self._yielded += 1
+            yield f"data: {json.dumps(event)}"
+        yield "data: [DONE]"
 
 
 class TestOpenAIProviderStream:
@@ -670,37 +665,29 @@ class TestOpenAIProviderStream:
 
     @staticmethod
     def _make_chunk(content: str | None = None, finish_reason: str | None = None):
-        from openai.types.chat import ChatCompletionChunk
-        from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
-
-        delta = ChoiceDelta(content=content)
-        choice = Choice(delta=delta, index=0, finish_reason=finish_reason)
-        return ChatCompletionChunk(
-            id="chunk-test",
-            created=1,
-            model="gpt-4o",
-            object="chat.completion.chunk",
-            choices=[choice],
-        )
+        delta = {"content": content} if content is not None else {}
+        return {
+            "id": "chunk-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
 
     @staticmethod
-    def _make_provider_with_stream(
-        fake_stream: _FakeAsyncOpenAIStream,
-    ) -> OpenAIProvider:
+    def _make_provider_with_stream(fake_stream: _FakeStreamingResponse):
         provider = OpenAIProvider(api_key="sk-123")
-
-        async def fake_create(**kwargs):
-            return fake_stream
-
         mock_client = MagicMock()
-        mock_client.chat.completions.create = fake_create
+        mock_client.chat.completions.with_streaming_response.create.return_value = (
+            fake_stream
+        )
         mock_client.is_closed.return_value = False
         provider._client = mock_client
         return provider
 
     @pytest.mark.asyncio
     async def test_stream_yields_chunks(self):
-        fake_stream = _FakeAsyncOpenAIStream(
+        fake_stream = _FakeStreamingResponse(
             [self._make_chunk(content="Hel"), self._make_chunk(content="lo")]
         )
         provider = self._make_provider_with_stream(fake_stream)
@@ -718,7 +705,7 @@ class TestOpenAIProviderStream:
 
     @pytest.mark.asyncio
     async def test_stream_closes_on_exception(self):
-        fake_stream = _FakeAsyncOpenAIStream(
+        fake_stream = _FakeStreamingResponse(
             [self._make_chunk(content="Hel"), self._make_chunk(content="lo")],
             error_after=1,
         )
@@ -738,7 +725,7 @@ class TestOpenAIProviderStream:
 
     @pytest.mark.asyncio
     async def test_stream_closes_on_early_aclose(self):
-        fake_stream = _FakeAsyncOpenAIStream(
+        fake_stream = _FakeStreamingResponse(
             [self._make_chunk(content="Hel"), self._make_chunk(content="lo")]
         )
         provider = self._make_provider_with_stream(fake_stream)
@@ -753,6 +740,38 @@ class TestOpenAIProviderStream:
         assert len(chunks) == 1
         assert fake_stream.entered is True
         assert fake_stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_surfaces_finish_and_usage(self):
+        fake_stream = _FakeStreamingResponse(
+            [
+                self._make_chunk(content="done", finish_reason="stop"),
+                {
+                    "id": "chunk-usage",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "gpt-4o",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                },
+            ]
+        )
+        provider = self._make_provider_with_stream(fake_stream)
+        messages = [Message(role=Role.USER, content=[TextBlock(text="Hi")])]
+
+        chunks = [chunk async for chunk in provider.stream(messages)]
+
+        assert chunks[0].delta == "done"
+        assert chunks[1].finish_reason is FinishReason.STOP
+        assert chunks[2].usage == {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "total_tokens": 5,
+        }
 
 
 # ---------------------------------------------------------------------------
