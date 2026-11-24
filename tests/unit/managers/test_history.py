@@ -159,3 +159,15 @@ class TestToolHistoryStoreConcurrent:
         await asyncio.gather(producer(), consumer())
         # At least some entries should be retrievable
         # (consumer may run before all producers finish)
+
+
+def test_truncation_is_logged(caplog):
+    async def run():
+        store = ToolHistoryStore(max_entry_chars=10)
+        with caplog.at_level("WARNING", logger="sanityops_agent.managers.history"):
+            key = await store.store("tool", "x" * 50)
+        entry = await store.get(key)
+        assert entry.content == "x" * 10
+        assert "truncated" in caplog.text
+
+    asyncio.run(run())

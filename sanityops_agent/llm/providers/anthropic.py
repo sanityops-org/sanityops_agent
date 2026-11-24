@@ -35,13 +35,15 @@ class AnthropicProvider(LLMProvider):
     Uses the official Anthropic SDK Messages API.
     Supports: text, thinking, tool_use content blocks.
 
+    An explicit positive ``max_tokens`` is required, either on the provider
+    constructor or on each call; the API has no usable default.
+
     Not thread-safe and not safe for concurrent asyncio access: the client
     is created lazily and closed by the agent that owns it.  Intended for
     sequential use within a single event loop.
     """
 
     DEFAULT_BASE_URL = "https://api.anthropic.com"
-    DEFAULT_MAX_TOKENS = 32768
 
     def __init__(
         self,

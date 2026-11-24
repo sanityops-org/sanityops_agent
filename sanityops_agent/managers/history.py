@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,14 +54,27 @@ class ToolHistoryStore:
             now = time.time()
             self._prune_expired(now)
             self._store.pop(key, None)
+            stored = content
+            if len(content) > self.max_entry_chars:
+                stored = content[: self.max_entry_chars]
+                logger.warning(
+                    "Tool history entry for %s truncated to %d characters",
+                    tool_name,
+                    self.max_entry_chars,
+                )
             self._store[key] = ToolHistoryEntry(
                 tool_name=tool_name,
-                content=content[: self.max_entry_chars],
+                content=stored,
                 timestamp=now,
                 tool_call_id=tool_call_id,
             )
             while len(self._store) > self.max_entries:
-                del self._store[next(iter(self._store))]
+                dropped = self._store.pop(next(iter(self._store)))
+                logger.debug(
+                    "Tool history entry for %s evicted (capacity %d)",
+                    dropped.tool_name,
+                    self.max_entries,
+                )
         return key
 
     async def get(self, key: str) -> ToolHistoryEntry | None:

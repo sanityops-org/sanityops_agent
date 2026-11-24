@@ -226,6 +226,9 @@ The runner is an async callable accepting the keyword arguments `command`,
 `timeout` and `max_output_bytes` and returning a `ToolResult`. The host
 controls mounts, inherited environment, network access and process cleanup.
 
+The file tools rely on POSIX descriptor-relative access (`os.name == "posix"`)
+and are not available on Windows; they raise `OSError` there.
+
 ### Managed services
 
 Use one factory, tool registry, tool context and set of stateful managers per
@@ -238,6 +241,19 @@ private directory.
 explicit absolute `env_file`. Pass `allowed_base_urls` to
 `ProviderFactory.create` to restrict the provider to approved HTTPS
 destinations and disable redirects and environment proxies.
+
+### Upgrading from 0.1.2
+
+- Anthropic requires a positive `max_tokens`. Pass it to the provider
+  constructor or to each call; there is no default.
+- `ThinkingBlock.thinking_signature` is now `ThinkingBlock.signature`. The old
+  attribute still reads the value, but new code should use `signature`.
+- The `ProviderConfig.LLM_PROVIDER` attribute is gone. The `LLM_PROVIDER`
+  environment variable still sets `PROVIDER`.
+- `AgentConfig.total_timeout` is a float; integer values keep working.
+- File tools need `ToolContext.set("workdir", ...)` (and
+  `allow_file_writes=True` for writes); Bash calls need a `shell_runner`.
+  Both are POSIX-only.
 
 ## Running Examples
 
