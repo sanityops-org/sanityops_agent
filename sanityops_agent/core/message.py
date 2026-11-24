@@ -59,9 +59,20 @@ class ThinkingBlock(ContentBlock):
     # Anthropic signature; Gemini reuses it for the thoughtSignature
     signature: str | None = field(default=None, repr=False)
 
+    @property
+    def thinking_signature(self) -> str | None:
+        """Deprecated alias for ``signature``, kept for existing callers."""
+        return self.signature
+
 
 @dataclass
 class RedactedThinkingBlock(ContentBlock):
+    """Encrypted reasoning that must be replayed verbatim.
+
+    Anthropic returns this block when a thinking block cannot be exposed;
+    it carries no readable text and must be sent back unchanged.
+    """
+
     type: ContentType = field(default=ContentType.REDACTED_THINKING, init=False)
     data: str = field(repr=False)
 

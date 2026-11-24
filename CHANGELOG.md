@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-11-24
+
+### Added
+- `RuntimeAgentConfig` export and `RedactedThinkingBlock`.
+- Per-run deadlines, results and token budgets; delegated work shares the
+  parent's remaining time and budget, and `AgentResult.usage_complete`
+  reports incomplete provider usage.
+- Shared tool dispatch in `ToolAgent` with execution-time permission checks
+  and JSON Schema validation of tool arguments.
+- Workspace-bounded file, glob and bash tools, and bounded tool history.
+- Stream assembly that preserves every streamed tool call and signed
+  thinking block.
+
+### Changed
+- **Breaking:** Anthropic requests require an explicit positive `max_tokens`;
+  there is no bundled default.
+- **Breaking:** `ThinkingBlock.thinking_signature` is renamed to `signature`;
+  a read-only alias remains.
+- **Breaking:** the `ProviderConfig.LLM_PROVIDER` attribute is removed. The
+  `LLM_PROVIDER` environment variable still sets `PROVIDER`.
+- **Breaking:** model-requested file tools require a host-configured
+  workspace, and bash requires a host-provided shell runner.
+- **Breaking:** `AgentConfig.total_timeout` is now a float.
+- OpenAI tool definitions opt into strict mode explicitly; OpenAI streams
+  read the response body to EOF instead of stopping at `[DONE]`.
+
+### Fixed
+- State files written with the legacy `thinking_signature` key restore their
+  signatures.
+- Legacy saved conversations keep signed thinking turns resumable.
+
 ## [0.0.3] - 2025-08-13
 
 ### Added

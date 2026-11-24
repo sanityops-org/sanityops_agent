@@ -417,3 +417,10 @@ class TestToolResult:
         )
         block = result.to_result_block("call_789")
         assert block.history_key == "stored_history"
+
+
+def test_thinking_signature_alias_reads_signature():
+    block = ThinkingBlock(thinking="reasoning", signature="sig-1")
+
+    assert block.thinking_signature == "sig-1"
+    assert block.signature == "sig-1"

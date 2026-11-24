@@ -406,3 +406,19 @@ def test_adapter_errors_exclude_response_payload(adapter):
     converted = adapter.map_exception(error)
     assert isinstance(converted, LLMError)
     assert "fixture-private-text" not in str(converted)
+
+
+def test_strict_schema_rejects_excessive_nesting():
+    node = {"type": "object", "properties": {}, "additionalProperties": False}
+    for _ in range(25):
+        node = {
+            "type": "object",
+            "properties": {"child": node},
+            "required": ["child"],
+            "additionalProperties": False,
+        }
+    tool = ToolDefinition("deep", "", node)
+    tool.provider_config = {"strict": True}
+
+    with pytest.raises(ValueError, match="nested too deeply"):
+        OpenAIAdapter().tools_to_provider([tool])

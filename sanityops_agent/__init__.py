@@ -44,6 +44,9 @@ from sanityops_agent.core import (
     ToolResultSummary,
     ToolUseBlock,
 )
+
+# ``AgentConfig`` above is the environment-backed settings model; this alias
+# exposes the explicit runtime dataclass under a distinct name.
 from sanityops_agent.core.agent import AgentConfig as RuntimeAgentConfig
 
 # Hooks

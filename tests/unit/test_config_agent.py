@@ -28,3 +28,10 @@ def test_provider_config_extra_body_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_EXTRA_BODY", '{"thinking": {"type": "disabled"}}')
     config = ProviderConfig()
     assert config.EXTRA_BODY == {"thinking": {"type": "disabled"}}
+
+
+def test_llm_provider_env_sets_provider(monkeypatch, tmp_path):
+    """The LLM_ prefix maps the LLM_PROVIDER env var onto PROVIDER."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    assert ProviderConfig().PROVIDER == "gemini"

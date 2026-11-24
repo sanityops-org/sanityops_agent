@@ -44,6 +44,7 @@ def _dump_tool_input(tool_input: dict) -> str:
 def _check_strict_schema(schema: dict, tool_name: str) -> None:
     """Check object constraints in schema positions, including local definitions."""
 
+    max_depth = 20
     unsupported = {
         "allOf",
         "oneOf",
@@ -55,7 +56,9 @@ def _check_strict_schema(schema: dict, tool_name: str) -> None:
         "else",
     }
 
-    def visit(node: dict) -> None:
+    def visit(node: dict, depth: int) -> None:
+        if depth > max_depth:
+            raise ValueError(f"Strict tool {tool_name} schema is nested too deeply")
         if disallowed := (unsupported & node.keys()):
             keys = ", ".join(sorted(disallowed))
             raise ValueError(
@@ -79,16 +82,16 @@ def _check_strict_schema(schema: dict, tool_name: str) -> None:
         for key in ("properties", "$defs", "definitions", "patternProperties"):
             for child in node.get(key, {}).values():
                 if isinstance(child, dict):
-                    visit(child)
+                    visit(child, depth + 1)
         for key in ("items", "anyOf", "prefixItems"):
             children = node.get(key, [])
             for child in children if isinstance(children, list) else [children]:
                 if isinstance(child, dict):
-                    visit(child)
+                    visit(child, depth + 1)
 
     if schema.get("type") != "object" or "anyOf" in schema:
         raise ValueError(f"Strict tool {tool_name} requires a root object")
-    visit(schema)
+    visit(schema, 0)
 
 
 class OpenAIAdapter(MessageAdapter):

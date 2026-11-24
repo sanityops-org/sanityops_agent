@@ -73,6 +73,8 @@ class BashTool(Tool):
                 return f"dangerous command pattern detected: {pattern}"
         return None
 
+    # The typed parameters describe the model-facing schema; the base class
+    # accepts generic kwargs.
     async def execute(  # type: ignore[override]
         self,
         command: str,
