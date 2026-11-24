@@ -1,4 +1,5 @@
 """Unit tests for SubAgent, SubAgentRequest, and SubAgentResponse."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -7,7 +8,7 @@ import pytest
 
 from sanityops_agent.agents.sub import SubAgent, SubAgentRequest, SubAgentResponse
 from sanityops_agent.core.agent import AgentConfig, AgentResult, TerminationReason
-from sanityops_agent.core.message import FinishReason, TextBlock
+from sanityops_agent.core.message import FinishReason, Role, TextBlock, ToolResultBlock
 from sanityops_agent.hooks.base import HookEvent, HookExecutor
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
 from sanityops_agent.tools.base import Tool, ToolResult
@@ -16,6 +17,7 @@ from sanityops_agent.tools.registry import ToolRegistry
 # ---------------------------------------------------------------------------
 # Stub tool implementations for testing
 # ---------------------------------------------------------------------------
+
 
 class ReadFileTool(Tool):
     name = "read_file"
@@ -49,6 +51,7 @@ class ParentOnlyTool(Tool):
 
 class TaskToolStub(Tool):
     """Stub mimicking the real TaskTool — sub-agents must NOT call this."""
+
     name = "task"
     description = "Delegate a task"
     parameters = {"type": "object", "properties": {"description": {"type": "string"}}}
@@ -61,6 +64,7 @@ class TaskToolStub(Tool):
 # ---------------------------------------------------------------------------
 # SubAgentRequest tests
 # ---------------------------------------------------------------------------
+
 
 class TestSubAgentRequest:
     def test_minimal_construction(self):
@@ -83,6 +87,7 @@ class TestSubAgentRequest:
 # ---------------------------------------------------------------------------
 # SubAgentResponse tests
 # ---------------------------------------------------------------------------
+
 
 class TestSubAgentResponse:
     def test_success(self):
@@ -111,6 +116,7 @@ class TestSubAgentResponse:
 # SubAgent default config tests
 # ---------------------------------------------------------------------------
 
+
 class TestSubAgentDefaults:
     def test_default_config_values(self):
         agent = SubAgent()
@@ -129,6 +135,7 @@ class TestSubAgentDefaults:
 # ---------------------------------------------------------------------------
 # SubAgent tool filtering tests
 # ---------------------------------------------------------------------------
+
 
 class TestSubAgentToolFiltering:
     def _make_registry(self) -> ToolRegistry:
@@ -172,10 +179,23 @@ class TestSubAgentToolFiltering:
     def test_forbidden_tool_names_constant(self):
         assert "task" in SubAgent.FORBIDDEN_TOOL_NAMES
 
+    def test_handles_tool_without_tags_attribute(self):
+        class TaglessTool:
+            name = "tagless"
+
+        reg = ToolRegistry()
+        reg.register(TaglessTool())  # type: ignore[arg-type]
+        agent = SubAgent(tool_registry=reg)
+
+        available = agent._get_available_tools()
+        assert [t.name for t in available] == ["tagless"]
+        assert agent._is_tool_allowed("tagless") is True
+
 
 # ---------------------------------------------------------------------------
 # SubAgent _call_llm tests
 # ---------------------------------------------------------------------------
+
 
 class TestSubAgentCallLLM:
     def _setup(self) -> tuple[SubAgent, AsyncMock]:
@@ -249,6 +269,7 @@ class TestSubAgentCallLLM:
 # SubAgent _execute_tools tests
 # ---------------------------------------------------------------------------
 
+
 class TestSubAgentExecuteTools:
     def _setup(self):
         reg = ToolRegistry()
@@ -285,6 +306,13 @@ class TestSubAgentExecuteTools:
         assert len(agent._errors) == 1
         assert "task" in agent._errors[0].message
         assert agent._errors[0].tool_name == "task"
+        agent.context.add_message.assert_called_once()
+        added_msg = agent.context.add_message.call_args.args[0]
+        assert added_msg.role == Role.USER
+        assert len(added_msg.content) == 1
+        assert isinstance(added_msg.content[0], ToolResultBlock)
+        assert added_msg.content[0].tool_call_id == "tc2"
+        assert added_msg.content[0].is_error is True
 
     @pytest.mark.asyncio
     async def test_execute_unknown_tool(self):
@@ -313,6 +341,7 @@ class TestSubAgentExecuteTools:
 # ---------------------------------------------------------------------------
 # SubAgent build_response test
 # ---------------------------------------------------------------------------
+
 
 class TestBuildResponse:
     def test_build_response_success(self):
@@ -347,6 +376,7 @@ class TestBuildResponse:
 # SubAgent create_request test
 # ---------------------------------------------------------------------------
 
+
 class TestCreateRequest:
     def test_create_request(self):
         agent = SubAgent()
@@ -358,6 +388,7 @@ class TestCreateRequest:
 # ---------------------------------------------------------------------------
 # SubAgent integration-style test (with hooks)
 # ---------------------------------------------------------------------------
+
 
 class TestSubAgentWithHooks:
     @pytest.mark.asyncio

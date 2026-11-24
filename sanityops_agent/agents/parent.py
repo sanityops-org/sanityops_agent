@@ -1,17 +1,9 @@
 """ParentAgent - concrete agent extending BaseAgent with LLM and tool implementations."""
+
 from __future__ import annotations
 
-from sanityops_agent.core.agent import (
-    AgentConfig,
-    BaseAgent,
-    TerminationReason,
-)
-from sanityops_agent.core.message import (
-    Message,
-    Role,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from sanityops_agent.agents.tool_agent import ToolAgent
+from sanityops_agent.core.agent import AgentConfig, TerminationReason
 from sanityops_agent.hooks.base import HookEvent, HookExecutor
 from sanityops_agent.llm.base import LLMProvider, LLMResponse
 from sanityops_agent.tools.registry import ToolRegistry
@@ -25,7 +17,7 @@ class HookBlockedException(Exception):
         super().__init__(message)
 
 
-class ParentAgent(BaseAgent):
+class ParentAgent(ToolAgent):
     """Concrete parent agent with real LLM calls and tool execution.
 
     Extends BaseAgent with:
@@ -87,18 +79,18 @@ class ParentAgent(BaseAgent):
         BEFORE_LLM_CALL is fired in _check_termination_conditions so that
         blocking can produce TerminationReason.HOOK_BLOCKED.
         """
+        assert self.context is not None  # invariant: context initialized in run()
         # Build tool definitions for available tools
-        tool_defs = self.tool_registry.to_tool_definitions(
-            self.config.allowed_tool_tags
-        )
+        tool_defs = self._tool_definitions()
 
         response = await self.provider.create(
-            self.context.messages, tools=tool_defs, **self._llm_call_kwargs()
+            self.context.messages,
+            tools=tool_defs,
+            **await self._provider_kwargs(self.provider, tool_defs),
         )
 
-        # Track token usage
-        if response.usage and "total_tokens" in response.usage:
-            self.tokens_used += response.usage["total_tokens"]
+        if self._usage is None:
+            self._record_usage(response.usage)
 
         # Fire AFTER_LLM_CALL hook
         if self.hook_executor:
@@ -107,108 +99,3 @@ class ParentAgent(BaseAgent):
             )
 
         return response
-
-    # ------------------------------------------------------------------
-    # Tool execution
-    # ------------------------------------------------------------------
-
-    async def _execute_tools(self, tool_calls: list[ToolUseBlock]) -> None:
-        """Execute tool calls from the LLM response.
-
-        For each tool call:
-        1. Fire BEFORE_TOOL_EXEC hook; if blocked, add error result and skip
-        2. Look up tool in registry and execute
-        3. Fire AFTER_TOOL_EXEC hook
-        4. Add ToolResultBlock to context
-        """
-        for tc in tool_calls:
-            tool_name = tc.tool_name
-            tool_input = tc.tool_input
-            tool_call_id = tc.tool_call_id
-
-            # Fire BEFORE_TOOL_EXEC hook
-            if self.hook_executor:
-                hook_ctx = await self.hook_executor.execute(
-                    HookEvent.BEFORE_TOOL_EXEC,
-                    {
-                        "tool_name": tool_name,
-                        "tool_input": tool_input,
-                        "tool_call_id": tool_call_id,
-                    },
-                )
-                if hook_ctx.blocked:
-                    # Add error ToolResultBlock instead of executing
-                    await self._add_tool_result(
-                        tool_call_id=tool_call_id,
-                        content=f"Tool execution blocked by hook: {tool_name}",
-                        is_error=True,
-                    )
-                    continue
-
-            # Look up and execute the tool
-            result_content: str
-            is_error: bool
-
-            tool = self.tool_registry.get(tool_name)
-            if tool is None:
-                result_content = f"Tool not found: {tool_name}"
-                is_error = True
-            else:
-                try:
-                    result = await tool.run(**tool_input)
-                    result_content = result.content
-                    is_error = not result.success
-                except Exception as e:
-                    result_content = f"Tool error: {e}"
-                    is_error = True
-                    self._record_error(
-                        "tool_error",
-                        str(e),
-                        iteration=0,
-                        tool_name=tool_name,
-                        recoverable=False,
-                    )
-
-            # Fire AFTER_TOOL_EXEC hook
-            if self.hook_executor:
-                await self.hook_executor.execute(
-                    HookEvent.AFTER_TOOL_EXEC,
-                    {
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "result": result_content,
-                        "is_error": is_error,
-                    },
-                )
-
-            # Add result to context
-            await self._add_tool_result(
-                tool_call_id=tool_call_id,
-                content=result_content,
-                is_error=is_error,
-            )
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    async def _add_tool_result(
-        self, tool_call_id: str, content: str, is_error: bool
-    ) -> None:
-        """Add a ToolResultBlock to the context.
-
-        Uses Role.USER (Anthropic standard). OpenAI adapter will convert
-        to role: "tool" when communicating with OpenAI-compatible APIs.
-        """
-        await self.context.add_message(
-            Message(
-                role=Role.USER,
-                content=[
-                    ToolResultBlock(
-                        tool_call_id=tool_call_id,
-                        tool_result_content=content,
-                        is_error=is_error,
-                    )
-                ],
-            )
-        )

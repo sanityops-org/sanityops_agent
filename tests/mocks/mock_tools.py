@@ -21,7 +21,9 @@ class MockTool(Tool):
         "required": [],
     }
 
-    def __init__(self, response: str = "mock result", context: ToolContext | None = None):
+    def __init__(
+        self, response: str = "mock result", context: ToolContext | None = None
+    ):
         super().__init__(context=context)
         self._response = response
         self.call_count = 0
@@ -44,7 +46,9 @@ class MockToolWithError(Tool):
         "required": [],
     }
 
-    def __init__(self, error_message: str = "mock error", context: ToolContext | None = None):
+    def __init__(
+        self, error_message: str = "mock error", context: ToolContext | None = None
+    ):
         super().__init__(context=context)
         self._error_message = error_message
 

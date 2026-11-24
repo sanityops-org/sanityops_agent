@@ -1,4 +1,5 @@
 """Unit tests for sanityops_agent.tools.builtins.history - HistoryTool"""
+
 from __future__ import annotations
 
 import asyncio

@@ -7,6 +7,7 @@ from enum import Enum
 class ContentType(Enum):
     TEXT = "text"
     THINKING = "thinking"
+    REDACTED_THINKING = "redacted_thinking"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
     ERROR = "error"  # Stream error block
@@ -14,6 +15,7 @@ class ContentType(Enum):
 
 class FinishReason(Enum):
     """Stream response finish reason"""
+
     END_TURN = "end_turn"
     TOOL_USE = "tool_use"
     STOP = "stop"
@@ -25,6 +27,7 @@ class FinishReason(Enum):
 
 class Role(Enum):
     """Message role"""
+
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
@@ -35,6 +38,7 @@ class Role(Enum):
 @dataclass(kw_only=True)
 class ContentBlock:
     """Content block base class"""
+
     type: ContentType = field(default=ContentType.TEXT)
     metadata: dict = field(default_factory=dict)
 
@@ -44,14 +48,33 @@ class ContentBlock:
 class TextBlock(ContentBlock):
     type: ContentType = field(default=ContentType.TEXT, init=False)
     text: str
-    text_signature: str | None = None  # Gemini thoughtSignature on text parts
+    # Gemini thoughtSignature attached to a text part
+    text_signature: str | None = field(default=None, repr=False)
 
 
 @dataclass
 class ThinkingBlock(ContentBlock):
     type: ContentType = field(default=ContentType.THINKING, init=False)
     thinking: str
-    thinking_signature: str | None = None  # Gemini thoughtSignature for reasoning replay
+    # Anthropic signature; Gemini reuses it for the thoughtSignature
+    signature: str | None = field(default=None, repr=False)
+
+    @property
+    def thinking_signature(self) -> str | None:
+        """Deprecated alias for ``signature``, kept for existing callers."""
+        return self.signature
+
+
+@dataclass
+class RedactedThinkingBlock(ContentBlock):
+    """Encrypted reasoning that must be replayed verbatim.
+
+    Anthropic returns this block when a thinking block cannot be exposed;
+    it carries no readable text and must be sent back unchanged.
+    """
+
+    type: ContentType = field(default=ContentType.REDACTED_THINKING, init=False)
+    data: str = field(repr=False)
 
 
 @dataclass
@@ -60,7 +83,8 @@ class ToolUseBlock(ContentBlock):
     tool_call_id: str
     tool_name: str
     tool_input: dict
-    thought_signature: str | None = None  # Gemini thoughtSignature on tool calls
+    # Gemini thoughtSignature attached to a function call
+    thought_signature: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -75,13 +99,21 @@ class ToolResultBlock(ContentBlock):
 @dataclass
 class ErrorBlock(ContentBlock):
     """Stream error block"""
+
     type: ContentType = field(default=ContentType.ERROR, init=False)
     error_code: str
     error_message: str
 
 
 # Union type - for type annotations
-ContentBlockUnion = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | ErrorBlock
+ContentBlockUnion = (
+    TextBlock
+    | ThinkingBlock
+    | RedactedThinkingBlock
+    | ToolUseBlock
+    | ToolResultBlock
+    | ErrorBlock
+)
 
 
 @dataclass
@@ -101,14 +133,14 @@ class Message:
 @dataclass
 class StreamChunk:
     """Stream response chunk, aligned with ContentBlock types"""
+
     type: ContentType
-    delta: str | dict | None = None
+    delta: str | dict | None = field(default=None, repr=False)
     tool_call_id: str | None = None
     index: int = 0
     finish_reason: FinishReason | None = None
-    # Token usage, when the provider reports it during streaming (Anthropic
-    # sends it on the final message_delta event). None when unreported.
     usage: dict | None = None
+    signature: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -132,9 +164,12 @@ class ErrorType(Enum):
 @dataclass
 class ToolResult:
     """Tool execution result - for internal, finally converted to ToolResultBlock"""
+
     success: bool
     content: str
-    tool_call_id: str | None = None  # Filled by Agent core when building ToolResultBlock
+    tool_call_id: str | None = (
+        None  # Filled by Agent core when building ToolResultBlock
+    )
     error: str | None = None
     error_type: ErrorType | None = None
 
@@ -148,7 +183,7 @@ class ToolResult:
         """Convert to ToolResultBlock for messages, pass history_key"""
         return ToolResultBlock(
             tool_call_id=tool_call_id,
-            tool_result_content=self.content if self.success else self.error,
+            tool_result_content=self.content if self.success else (self.error or ""),
             is_error=not self.success,
-            history_key=self.history_key
+            history_key=self.history_key,
         )

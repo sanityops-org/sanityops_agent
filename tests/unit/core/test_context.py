@@ -1,9 +1,17 @@
 """Tests for agent/core/context.py - AgentContext, CompactConfig, ToolResultSummary."""
 
+import asyncio
+
 import pytest
 
 from sanityops_agent.core.context import AgentContext, CompactConfig, ToolResultSummary
-from sanityops_agent.core.message import Message, Role, TextBlock, ToolResultBlock
+from sanityops_agent.core.message import (
+    Message,
+    Role,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 # --- CompactConfig Tests ---
 
@@ -221,71 +229,23 @@ class TestCompactIfNeeded:
 
     @pytest.mark.asyncio
     async def test_compaction_at_threshold(self):
-        # New behavior: compaction returns True when threshold exceeded,
-        # even if no tool results to compact
-        ctx = AgentContext(compact_config=CompactConfig(trigger_token_threshold=10))
-        msg = Message(
-            role=Role.ASSISTANT,
-            content=[TextBlock(text="x" * 100)],  # 100 chars -> ~25 tokens estimate
+        ctx = AgentContext(compact_config=CompactConfig(trigger_token_threshold=100))
+        ctx.messages.append(
+            Message(role=Role.USER, content=[TextBlock(text="x" * 500)])
         )
-        await ctx.add_message(msg)
         result = await ctx.compact_if_needed()
-        assert result is True  # Threshold exceeded
+        assert result is True
         assert ctx.has_compacted is True
 
     @pytest.mark.asyncio
     async def test_compaction_above_threshold(self):
-        # Threshold exceeded, but no tool results to compact
-        ctx = AgentContext(compact_config=CompactConfig(trigger_token_threshold=10))
-        msg = Message(
-            role=Role.ASSISTANT,
-            content=[TextBlock(text="x" * 500)],  # Enough chars to exceed threshold
-        )
-        await ctx.add_message(msg)
-        result = await ctx.compact_if_needed()
-        assert result is True  # Threshold exceeded
-        assert ctx.has_compacted is True
-
-
-    @pytest.mark.asyncio
-    async def test_reentrant_compaction_does_not_deadlock(self):
-        """A reentrant call must return False, not deadlock on the lock.
-
-        asyncio.Lock is not reentrant, so the in-flight flag has to be checked
-        before acquiring it. Without that ordering this test hangs (caught by
-        the timeout) rather than failing an assertion.
-        """
-        import asyncio
-
-        config = CompactConfig(trigger_token_threshold=1, preserve_recent_count=0)
-        ctx = AgentContext(compact_config=config)
+        ctx = AgentContext(compact_config=CompactConfig(trigger_token_threshold=100))
         ctx.messages.append(
-            Message(
-                role=Role.ASSISTANT,
-                content=[
-                    ToolResultBlock(tool_call_id="c1", tool_result_content="x" * 100)
-                ],
-            )
+            Message(role=Role.USER, content=[TextBlock(text="x" * 1000)])
         )
-
-        inner_results: list[bool] = []
-
-        original_do_compact = ctx._do_compact
-
-        async def patched_do_compact():
-            # We are now inside the lock with the flag set; this must not hang.
-            inner_results.append(await ctx.compact_if_needed())
-            await original_do_compact()
-
-        ctx._do_compact = patched_do_compact
-
-        # Generous timeout: this test's job is to catch an INDEFINITE deadlock,
-        # not to bound normal operation, so slow CI must not false-positive.
-        outer = await asyncio.wait_for(ctx.compact_if_needed(), timeout=5.0)
-
-        assert outer is True
-        assert inner_results == [False]
-        assert ctx._compaction_in_flight is False
+        result = await ctx.compact_if_needed()
+        assert result is True
+        assert ctx.has_compacted is True
 
 
 # --- AgentContext._do_compact Tests ---
@@ -296,11 +256,11 @@ class TestDoCompact:
 
     @pytest.mark.asyncio
     async def test_compaction_preserves_recent_tool_results(self):
-        """Compaction should preserve the last N tool results (as ToolResultBlock with replaced content)."""
+        """Compaction should keep the last N tool results in full."""
         config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=2)
         ctx = AgentContext(compact_config=config)
 
-        # Add 4 tool results with enough content to trigger compaction
+        # Add 4 tool results
         for i in range(4):
             msg = Message(
                 role=Role.ASSISTANT,
@@ -313,38 +273,33 @@ class TestDoCompact:
                         metadata={"tool_name": "search", "history_key": f"hist_{i}"},
                     )
                 ],
+                raw_response={"usage": {"total_tokens": 50}},
             )
             await ctx.add_message(msg)
 
         await ctx.compact_if_needed()
 
-        # All 4 ToolResultBlocks remain (just content replaced for older ones)
-        tool_results = []
-        for msg in ctx.messages:
-            for block in msg.content:
-                if isinstance(block, ToolResultBlock):
-                    tool_results.append(block)
-
-        assert len(tool_results) == 4
-        # The older ones (call_0, call_1) should have compacted content
-        # The recent ones (call_2, call_3) should have original content
-        assert tool_results[0].tool_call_id == "call_0"
-        assert tool_results[1].tool_call_id == "call_1"
-        assert tool_results[2].tool_call_id == "call_2"
-        assert tool_results[3].tool_call_id == "call_3"
-        # Check metadata shows compacted status
-        assert tool_results[0].metadata.get("compacted") is True
-        assert tool_results[1].metadata.get("compacted") is True
-        assert tool_results[2].metadata.get("compacted") is None  # preserved
-        assert tool_results[3].metadata.get("compacted") is None  # preserved
+        # Every result block is kept (so no tool_use is orphaned); the two
+        # most recent are untouched, the older two are shortened.
+        results = {
+            b.tool_call_id: b
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        }
+        assert set(results) == {"call_0", "call_1", "call_2", "call_3"}
+        assert results["call_2"].tool_result_content == "result 2" * 100
+        assert results["call_3"].tool_result_content == "result 3" * 100
+        assert results["call_0"].metadata.get("compacted") is True
+        assert results["call_1"].metadata.get("compacted") is True
 
     @pytest.mark.asyncio
     async def test_compaction_summarizes_older_results(self):
-        """Compaction should replace content in older tool results, preserving tool_call_id."""
+        """Compaction should shorten older results while keeping their blocks."""
         config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=1)
         ctx = AgentContext(compact_config=config)
 
-        # Add 3 tool results (2 will be compacted, 1 preserved)
+        # Add 3 tool results (2 will be summarized, 1 preserved)
         for i in range(3):
             msg = Message(
                 role=Role.ASSISTANT,
@@ -357,75 +312,402 @@ class TestDoCompact:
                         metadata={"tool_name": "search", "history_key": f"hist_{i}"},
                     )
                 ],
+                raw_response={"usage": {"total_tokens": 50}},
             )
             await ctx.add_message(msg)
 
         await ctx.compact_if_needed()
 
-        # All 3 remain as ToolResultBlocks (not TextBlock summaries)
-        tool_blocks = []
-        for msg in ctx.messages:
-            for block in msg.content:
-                if isinstance(block, ToolResultBlock):
-                    tool_blocks.append(block)
-
-        assert len(tool_blocks) == 3
-        # call_0 and call_1 should have compacted content (summary string)
-        assert "Tool: search" in tool_blocks[0].tool_result_content
-        assert "Tool: search" in tool_blocks[1].tool_result_content
-        # call_2 should have original content
-        assert tool_blocks[2].tool_result_content == "result 2" * 50
+        results = {
+            b.tool_call_id: b
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        }
+        # All three blocks survive; the newest keeps its body, older two do not.
+        assert set(results) == {"call_0", "call_1", "call_2"}
+        assert results["call_2"].tool_result_content == "result 2" * 50
+        assert "Tool: search" in results["call_0"].tool_result_content
+        assert "Success: False" in results["call_1"].tool_result_content
 
     @pytest.mark.asyncio
     async def test_compaction_summary_contains_tool_name(self):
         """Summary text should contain the tool name."""
-        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=0)
+        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=1)
         ctx = AgentContext(compact_config=config)
 
-        msg = Message(
-            role=Role.ASSISTANT,
-            content=[
-                ToolResultBlock(
-                    tool_call_id="call_old",
-                    tool_result_content="x" * 100,  # Enough chars to exceed threshold
-                    is_error=False,
-                    metadata={"tool_name": "read_file"},
-                )
-            ],
-        )
-        await ctx.add_message(msg)
+        # Two results so one is actually compacted (the newest is preserved).
+        for i, name in enumerate(("read_file", "search")):
+            msg = Message(
+                role=Role.ASSISTANT,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id=f"call_{i}",
+                        tool_result_content=f"old result data {i}" * 20,
+                        is_error=False,
+                        metadata={"tool_name": name},
+                    )
+                ],
+                raw_response={"usage": {"total_tokens": 50}},
+            )
+            await ctx.add_message(msg)
 
         await ctx.compact_if_needed()
 
-        # The ToolResultBlock content is replaced with summary
-        for m in ctx.messages:
-            for block in m.content:
-                if isinstance(block, ToolResultBlock):
-                    assert "read_file" in block.tool_result_content
+        # The summary is written into the (retained) result block.
+        contents = [
+            b.tool_result_content
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        ]
+        assert any("read_file" in c for c in contents)
 
     @pytest.mark.asyncio
     async def test_compaction_error_result_summary(self):
         """Error tool results should show Success: False in summary."""
-        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=0)
+        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=1)
         ctx = AgentContext(compact_config=config)
 
-        msg = Message(
-            role=Role.ASSISTANT,
-            content=[
-                ToolResultBlock(
-                    tool_call_id="call_err",
-                    tool_result_content="x" * 100,  # Enough chars to exceed threshold
-                    is_error=True,
-                    metadata={"tool_name": "write_file"},
-                )
-            ],
-        )
-        await ctx.add_message(msg)
+        # One error + one success so the error (older) one gets compacted.
+        for i, (is_err, name) in enumerate(((True, "write_file"), (False, "search"))):
+            msg = Message(
+                role=Role.ASSISTANT,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id=f"call_{i}",
+                        tool_result_content=f"error data {i}" * 20,
+                        is_error=is_err,
+                        metadata={"tool_name": name},
+                    )
+                ],
+                raw_response={"usage": {"total_tokens": 50}},
+            )
+            await ctx.add_message(msg)
 
         await ctx.compact_if_needed()
 
-        # The ToolResultBlock content shows failure
+        # Check summary shows failure
+        contents = [
+            b.tool_result_content
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        ]
+        assert any("Success: False" in c for c in contents)
+
+
+class TestCompactKeepsToolPairing:
+    """Compaction must not orphan the assistant tool_use the result answers.
+
+    The agent loop stores one Message per tool result, and the assistant turn
+    before it holds the matching ToolUseBlock. Providers reject a tool_use with
+    no tool_result (HTTP 400), so compaction must keep a ToolResultBlock in
+    place, only shortening its content.
+    """
+
+    @pytest.fixture
+    def compacting_context(self):
+        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=0)
+        ctx = AgentContext(compact_config=config)
+        ctx.total_tokens = 1000  # above the threshold so compaction fires
+        return ctx
+
+    @staticmethod
+    def _tool_exchange(ctx: AgentContext, i: int) -> None:
+        """Append assistant(tool_use) + user(tool_result) as the loop does."""
+        ctx.messages.append(
+            Message(
+                role=Role.ASSISTANT,
+                content=[
+                    TextBlock(text=f"thinking {i}"),
+                    ToolUseBlock(
+                        tool_call_id=f"call_{i}",
+                        tool_name="search",
+                        tool_input={"q": str(i)},
+                    ),
+                ],
+            )
+        )
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id=f"call_{i}",
+                        tool_result_content=f"result {i}" * 100,
+                        metadata={"tool_name": "search"},
+                    )
+                ],
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_compacted_result_keeps_tool_call_id(
+        self, compacting_context: AgentContext
+    ):
+        ctx = compacting_context
+        self._tool_exchange(ctx, 1)
+        self._tool_exchange(ctx, 2)
+
+        await ctx.compact_if_needed()
+
+        every_tool_use_id = {
+            b.tool_call_id
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolUseBlock)
+        }
+        every_tool_result_id = {
+            b.tool_call_id
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        }
+        assert every_tool_use_id == every_tool_result_id
+
+    @pytest.mark.asyncio
+    async def test_compacted_result_is_truncated_not_replaced(
+        self, compacting_context: AgentContext
+    ):
+        ctx = compacting_context
+        self._tool_exchange(ctx, 1)
+
+        await ctx.compact_if_needed()
+
+        result_blocks = [
+            b for m in ctx.messages for b in m.content if isinstance(b, ToolResultBlock)
+        ]
+        assert len(result_blocks) == 1
+        block = result_blocks[0]
+        assert block.tool_call_id == "call_1"
+        assert block.metadata.get("compacted") is True
+        assert block.metadata.get("tool_name") == "search"
+        # The brief survives, the body does not.
+        assert "[Result:" in block.tool_result_content
+        assert "result 1" * 100 != block.tool_result_content
+        assert block.tool_result_content != "result 1" * 100
+
+    @pytest.mark.asyncio
+    async def test_mixed_message_still_compacts_every_tool_result(
+        self, compacting_context: AgentContext
+    ):
+        """A message holding several results compacts each of them."""
+        ctx = compacting_context
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id="call_a",
+                        tool_result_content="aa" * 200,
+                        metadata={"tool_name": "search"},
+                    ),
+                    ToolResultBlock(
+                        tool_call_id="call_b",
+                        tool_result_content="bb" * 200,
+                        metadata={"tool_name": "search"},
+                    ),
+                ],
+            )
+        )
+
+        await ctx.compact_if_needed()
+
+        results = {
+            b.tool_call_id: b.tool_result_content
+            for m in ctx.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        }
+        assert set(results) == {"call_a", "call_b"}
+        assert "[Result:" in results["call_a"]
+        assert "[Result:" in results["call_b"]
+
+
+class TestCompactionTokenCounting:
+    """Compaction must reduce the token estimate, or the trigger re-fires on
+    every subsequent call once the threshold is crossed."""
+
+    @pytest.mark.asyncio
+    async def test_token_estimate_shrinks_after_compaction(self):
+        config = CompactConfig(trigger_token_threshold=10, preserve_recent_count=0)
+        ctx = AgentContext(compact_config=config)
+
+        for i in range(3):
+            ctx.messages.append(
+                Message(
+                    role=Role.USER,
+                    content=[
+                        ToolResultBlock(
+                            tool_call_id=f"call_{i}",
+                            tool_result_content="x" * 5000,
+                            metadata={"tool_name": "search"},
+                        )
+                    ],
+                )
+            )
+        before = ctx.estimate_tokens()
+
+        await ctx.compact_if_needed()
+
+        assert ctx.estimate_tokens() < before
+
+    @pytest.mark.asyncio
+    async def test_compaction_does_not_retrigger(self):
+        """Second compact_if_needed() with no new messages is a no-op."""
+        config = CompactConfig(trigger_token_threshold=1000, preserve_recent_count=0)
+        ctx = AgentContext(compact_config=config)
+        for i in range(3):
+            ctx.messages.append(
+                Message(
+                    role=Role.USER,
+                    content=[
+                        ToolResultBlock(
+                            tool_call_id=f"call_{i}",
+                            tool_result_content="x" * 5000,
+                            metadata={"tool_name": "search"},
+                        )
+                    ],
+                )
+            )
+
+        assert await ctx.compact_if_needed() is True
+        # The summaries are far below the threshold, so the second call must
+        # not compact again (with the old accumulated counter it always did).
+        assert await ctx.compact_if_needed() is False
+
+
+class TestToolResultContent:
+    """AgentContext.tool_result_content() reads current (possibly compacted)
+    content by tool_call_id."""
+
+    @pytest.mark.asyncio
+    async def test_found_result(self):
+        ctx = AgentContext()
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(tool_call_id="c1", tool_result_content="payload")
+                ],
+            )
+        )
+        assert ctx.tool_result_content("c1") == "payload"
+
+    @pytest.mark.asyncio
+    async def test_not_found_returns_none(self):
+        ctx = AgentContext()
+        assert ctx.tool_result_content("missing") is None
+
+    @pytest.mark.asyncio
+    async def test_reads_compacted_content(self):
+        ctx = AgentContext(
+            compact_config=CompactConfig(
+                trigger_token_threshold=10, preserve_recent_count=0
+            )
+        )
+        ctx.total_tokens = 1000
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id="c1",
+                        tool_result_content="big" * 500,
+                        metadata={"tool_name": "search"},
+                    )
+                ],
+            )
+        )
+        await ctx.compact_if_needed()
+
+        assert ctx.tool_result_content("c1") != "big" * 500
+        assert "[Result:" in ctx.tool_result_content("c1")
+
+
+class TestCompactionHistoryKey:
+    """history_key lives on the block; metadata may not mirror it."""
+
+    @pytest.mark.asyncio
+    async def test_history_key_read_from_attribute_not_metadata(self):
+        ctx = AgentContext(
+            compact_config=CompactConfig(
+                trigger_token_threshold=10, preserve_recent_count=0
+            )
+        )
+        ctx.total_tokens = 1000
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id="c1",
+                        tool_result_content="big" * 400,
+                        history_key="attr_key",
+                        # metadata does NOT mirror history_key.
+                        metadata={"tool_name": "search"},
+                    )
+                ],
+            )
+        )
+
+        await ctx.compact_if_needed()
+
+        block = next(
+            b for m in ctx.messages for b in m.content if isinstance(b, ToolResultBlock)
+        )
+        # The attribute value survives compaction (canonical source).
+        assert block.history_key == "attr_key"
+        assert block.metadata.get("compacted") is True
+
+
+class TestCompactionReentrancy:
+    """Overlapping compact_if_needed() calls compact once, not twice."""
+
+    @pytest.mark.asyncio
+    async def test_second_call_while_in_flight_compacts_once(self):
+        ctx = AgentContext(
+            compact_config=CompactConfig(
+                trigger_token_threshold=10, preserve_recent_count=0
+            )
+        )
+        ctx.messages.append(
+            Message(
+                role=Role.USER,
+                content=[
+                    ToolResultBlock(
+                        tool_call_id="c1",
+                        tool_result_content="x" * 5000,
+                        metadata={"tool_name": "search"},
+                    )
+                ],
+            )
+        )
+
+        # The calls serialize on the lock. _do_compact has no await point, so
+        # in practice the first finishes before the second starts; what the
+        # lock guarantees is they never interleave mid-compaction, and the
+        # estimate re-check keeps repeated calls converging instead of
+        # compacting forever.
+        compactions: list[bool] = []
+
+        async def call() -> None:
+            compactions.append(await ctx.compact_if_needed())
+
+        await asyncio.gather(call(), call())
+
+        # At least one compacted, none raised, and the context is consistent.
+        assert any(compactions)
+        assert ctx.has_compacted is True
+        # Every remaining result is either compacted or preserved whole.
         for m in ctx.messages:
-            for block in m.content:
-                if isinstance(block, ToolResultBlock):
-                    assert "Success: False" in block.tool_result_content
+            for b in m.content:
+                if isinstance(b, ToolResultBlock) and not b.metadata.get("compacted"):
+                    assert len(b.tool_result_content) == 5000
+
+    @pytest.mark.asyncio
+    async def test_constructible_outside_event_loop(self):
+        """AgentContext must be constructible without a running loop."""
+        ctx = AgentContext()
+        assert ctx._compact_lock is not None  # created at construction

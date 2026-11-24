@@ -1,10 +1,14 @@
 """AgentFactory - creates ParentAgent and SubAgent instances."""
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import copy
+from dataclasses import fields
+from typing import TYPE_CHECKING, Any
 
 from sanityops_agent.agents.parent import ParentAgent
 from sanityops_agent.agents.sub import SubAgent
+from sanityops_agent.config import AgentConfig as EnvironmentAgentConfig
 from sanityops_agent.core.agent import AgentConfig
 from sanityops_agent.hooks.base import HookExecutor
 from sanityops_agent.llm.base import LLMProvider
@@ -25,20 +29,33 @@ class AgentFactory:
     def __init__(
         self,
         provider: LLMProvider,
-        config: AgentConfig | None = None,
+        config: AgentConfig | EnvironmentAgentConfig | None = None,
         tool_registry: ToolRegistry | None = None,
         hook_executor: HookExecutor | None = None,
         inject_skill_info: bool = True,
     ):
         self.provider = provider
-        self.config = config or AgentConfig()
+        self.config = (
+            config.to_runtime_config()
+            if isinstance(config, EnvironmentAgentConfig)
+            else config or AgentConfig()
+        )
         # Use explicit None check to avoid creating new registry when empty
-        self.tool_registry = tool_registry if tool_registry is not None else ToolRegistry()
+        self.tool_registry = (
+            tool_registry if tool_registry is not None else ToolRegistry()
+        )
         self.hook_executor = hook_executor
         self.inject_skill_info = inject_skill_info
 
-        # Inject self into ToolContext so TaskTool can create sub-agents
+        # Intentionally store a strong reference in ToolContext so TaskTool can
+        # still spawn sub-agents even if the caller only retains the parent agent.
+        # Call close() if you need to break the factory <-> registry cycle early.
         self.tool_registry.context.set("agent_factory", self)
+
+    def close(self) -> None:
+        """Break the reference cycle with ToolContext when disposing the factory."""
+        if self.tool_registry.context.get("agent_factory") is self:
+            self.tool_registry.context.remove("agent_factory")
 
     @staticmethod
     def _build_skill_prompt(skill_manager: SkillManager | None) -> str:
@@ -56,7 +73,12 @@ class AgentFactory:
             return ""
 
         skills = skill_manager.describe_available()
-        if not skills:
+        valid_skills = [
+            skill
+            for skill in skills
+            if isinstance(skill.get("name"), str) and skill["name"].strip()
+        ]
+        if not valid_skills:
             return ""
 
         lines = [
@@ -67,15 +89,15 @@ class AgentFactory:
             "",
         ]
 
-        for skill in skills:
-            name = skill.get("name", "")
+        for skill in valid_skills:
+            name = skill["name"].strip()
             description = skill.get("description", "No description")
             lines.append(f"- **{name}**: {description}")
-            lines.append(f"  Usage: `skill(operation=\"load\", name=\"{name}\")`")
+            lines.append(f'  Usage: `skill(operation="load", name="{name}")`')
             lines.append("")
 
         lines.append(
-            "Use `skill(operation=\"load\", name=\"<skill_name>\")` to load a skill's full documentation."
+            'Use `skill(operation="load", name="<skill_name>")` to load a skill\'s full documentation.'
         )
         lines.append("")
 
@@ -101,6 +123,26 @@ class AgentFactory:
 
         return system_prompt + skill_section
 
+    def _build_config(
+        self,
+        system_prompt: str,
+        defaults: dict[str, Any] | None = None,
+        **overrides: Any,
+    ) -> AgentConfig:
+        """Clone the factory's AgentConfig and apply role defaults and overrides."""
+        config_fields = fields(AgentConfig)
+        valid_fields = {f.name for f in config_fields}
+        config_values: dict[str, Any] = {
+            f.name: copy.deepcopy(getattr(self.config, f.name)) for f in config_fields
+        }
+        if defaults:
+            config_values.update(defaults)
+        config_values["system_prompt"] = system_prompt
+        for k, v in overrides.items():
+            if k in valid_fields:
+                config_values[k] = v
+        return AgentConfig(**config_values)
+
     def create_parent_agent(self, system_prompt: str = "", **overrides) -> ParentAgent:
         """Create a ParentAgent with full tool access.
 
@@ -109,7 +151,7 @@ class AgentFactory:
         to disable this behavior.
 
         Args:
-            system_prompt: System prompt for the
+            system_prompt: System prompt for the parent agent.
             **overrides: Override any AgentConfig fields.
 
         Returns:
@@ -117,17 +159,7 @@ class AgentFactory:
         """
         # Inject skill metadata into system prompt
         enhanced_prompt = self._inject_skill_prompt(system_prompt)
-
-        # Start from the factory's config, then apply system_prompt and overrides
-        cfg = AgentConfig(**{
-            k: v
-            for k, v in self.config.__dict__.items()
-            if k in AgentConfig.__dataclass_fields__
-        })
-        cfg.system_prompt = enhanced_prompt
-        for k, v in overrides.items():
-            if k in AgentConfig.__dataclass_fields__:
-                setattr(cfg, k, v)
+        cfg = self._build_config(enhanced_prompt, **overrides)
         return ParentAgent(
             cfg,
             self.provider,
@@ -138,30 +170,25 @@ class AgentFactory:
     def create_sub_agent(self, system_prompt: str = "", **overrides) -> SubAgent:
         """Create a SubAgent with filtered tool access.
 
-        Sub-agents have tighter limits (max_loops=10, timeout=120s) and
-        cannot access tools tagged with 'parent_only'.
+        Sub-agents inherit factory config with tighter loop/timeout caps
+        (max_loops<=10, total_timeout<=120s unless overridden) and cannot
+        access tools tagged with 'parent_only'.
 
         Args:
-            system_prompt: System prompt for the
+            system_prompt: System prompt for the sub-agent.
             **overrides: Override any AgentConfig fields.
 
         Returns:
             A configured SubAgent instance.
         """
-        # Build sub-agent config with tighter limits
-        sub_overrides: dict = {
-            "max_loops": 10,
-            "total_timeout": 120,
-            "system_prompt": system_prompt,
-            "max_tokens": self.config.max_tokens,
-            "max_empty_responses": self.config.max_empty_responses,
-        }
-        # Apply user overrides (can override the defaults above)
-        for k, v in overrides.items():
-            if k in AgentConfig.__dataclass_fields__:
-                sub_overrides[k] = v
-
-        cfg = AgentConfig(**sub_overrides)
+        cfg = self._build_config(
+            system_prompt,
+            defaults={
+                "max_loops": min(self.config.max_loops, 10),
+                "total_timeout": min(self.config.total_timeout, 120),
+            },
+            **overrides,
+        )
 
         # Filter out parent_only tools for sub-agents
         sub_registry = self._filter_registry(exclude_tags=["parent_only"])
@@ -174,9 +201,14 @@ class AgentFactory:
         )
 
     def _filter_registry(self, exclude_tags: list[str]) -> ToolRegistry:
-        """Create a new registry excluding tools with the given tags."""
+        """Create a new registry excluding tools with the given tags.
+
+        Intentionally shares ToolContext with the parent registry so filtered
+        sub-agent tools can access shared managers (e.g., skill_manager).
+        """
         new_registry = ToolRegistry(context=self.tool_registry.context)
         for tool in self.tool_registry.list_all():
-            if not any(tag in exclude_tags for tag in tool.tags):
+            tags = getattr(tool, "tags", None) or ()
+            if not any(tag in exclude_tags for tag in tags):
                 new_registry.register(tool)
         return new_registry

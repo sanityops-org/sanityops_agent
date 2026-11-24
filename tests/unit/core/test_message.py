@@ -1,6 +1,5 @@
 """Tests for agent/core/message.py - Message model classes."""
 
-
 from sanityops_agent.core.message import (
     ContentType,
     ErrorBlock,
@@ -40,7 +39,14 @@ class TestContentType:
 
     def test_all_members_exist(self):
         members = {e.name for e in ContentType}
-        assert members == {"TEXT", "THINKING", "TOOL_USE", "TOOL_RESULT", "ERROR"}
+        assert members == {
+            "TEXT",
+            "THINKING",
+            "REDACTED_THINKING",
+            "TOOL_USE",
+            "TOOL_RESULT",
+            "ERROR",
+        }
 
 
 class TestFinishReason:
@@ -312,7 +318,10 @@ class TestToolDefinition:
         td = ToolDefinition(
             name="search",
             description="Search the web",
-            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
         )
         assert td.name == "search"
         assert td.description == "Search the web"
@@ -408,3 +417,10 @@ class TestToolResult:
         )
         block = result.to_result_block("call_789")
         assert block.history_key == "stored_history"
+
+
+def test_thinking_signature_alias_reads_signature():
+    block = ThinkingBlock(thinking="reasoning", signature="sig-1")
+
+    assert block.thinking_signature == "sig-1"
+    assert block.signature == "sig-1"

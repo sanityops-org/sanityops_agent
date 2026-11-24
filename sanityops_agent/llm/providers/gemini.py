@@ -33,7 +33,8 @@ class GeminiProvider(LLMProvider):
     def __init__(
         self,
         api_key: str,
-        base_url: str | None = None,  # Not currently used; kept for signature compatibility
+        base_url: str
+        | None = None,  # Not currently used; kept for signature compatibility
         model: str = DEFAULT_MODEL,
         # Vertex AI configuration
         project_id: str | None = None,
@@ -54,9 +55,7 @@ class GeminiProvider(LLMProvider):
         self._client: genai.Client | None = None
         self.adapter = GeminiAdapter(store_thinking=store_thinking, model_id=model)
 
-    def _build_config(
-        self, payload: dict, kwargs: dict
-    ) -> types.GenerateContentConfig:
+    def _build_config(self, payload: dict, kwargs: dict) -> types.GenerateContentConfig:
         """Build a GenerateContentConfig from the adapter payload and kwargs.
 
         - systemInstruction goes into ``system_instruction``
@@ -198,8 +197,7 @@ class GeminiProvider(LLMProvider):
 
             async for chunk in stream:
                 raw = chunk.model_dump(by_alias=True, exclude_none=True)
-                result = self.adapter.from_provider_chunk(raw)
-                if result:
+                for result in self.adapter.from_provider_chunks(raw):
                     yield result
 
         except Exception as e:

@@ -21,6 +21,7 @@ from sanityops_agent.llm.exceptions import LLMError
 @dataclass
 class MockResponseConfig:
     """Configure a single mock response."""
+
     content: list[ContentBlockUnion]
     stop_reason: FinishReason = FinishReason.END_TURN
     usage: dict = field(default_factory=lambda: {"total_tokens": 100})

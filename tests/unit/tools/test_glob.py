@@ -100,5 +100,63 @@ class TestGlobTool(IsolatedAsyncioTestCase):
         self.assertNotIn("directory.py", result.content)
 
 
+class TestGlobWorkspace(IsolatedAsyncioTestCase):
+    async def test_model_glob_stays_inside_workspace(self):
+        from sanityops_agent.tools.context import (
+            ToolContext,
+            ToolInvocation,
+            current_tool_invocation,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            outside = Path(temp) / "elsewhere"
+            outside.mkdir()
+            (outside / "outside-fixture.txt").touch()
+            (root / "inside-fixture.txt").touch()
+            (root / "linked").symlink_to(outside)
+            context = ToolContext()
+            context.set("workdir", root)
+            tool = GlobTool(context)
+            token = current_tool_invocation.set(
+                ToolInvocation(agent=None, allowed_tools=frozenset())
+            )
+            self.addCleanup(current_tool_invocation.reset, token)
+            result = await tool.execute(pattern="**/*fixture.txt")
+            self.assertTrue(result.success, result.error)
+            self.assertIn("inside-fixture.txt", result.content)
+            self.assertNotIn("outside-fixture.txt", result.content)
+            self.assertFalse((await tool.execute(pattern="../elsewhere/*.txt")).success)
+            self.assertFalse(
+                (await tool.execute(pattern="*.txt", path=str(outside))).success
+            )
+            self.assertFalse(
+                (await tool.execute(pattern="*.txt", path="linked")).success
+            )
+            context.remove("workdir")
+            self.assertFalse(
+                (await tool.execute(pattern="*.txt", path=str(outside))).success
+            )
+
+    async def test_entry_and_result_limits(self):
+        from unittest.mock import patch
+
+        from sanityops_agent.tools import workspace
+
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ["a", "b", "c"]:
+                (Path(temp) / name).touch()
+            tool = GlobTool()
+            with patch.object(workspace, "MAX_ENTRIES", 2):
+                self.assertFalse(
+                    (await tool.execute(pattern="*.txt", path=temp)).success
+                )
+            with patch.object(workspace, "MAX_MATCHES", 2):
+                result = await tool.execute(pattern="*", path=temp)
+                self.assertEqual(result.metadata["match_count"], 2)
+                self.assertTrue(result.metadata["truncated"])
+
+
 if __name__ == "__main__":
     main()

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 class HookEvent(Enum):
     """Events that hooks can subscribe to."""
+
     BEFORE_LLM_CALL = "before_llm_call"
     AFTER_LLM_CALL = "after_llm_call"
     BEFORE_TOOL_EXEC = "before_tool_exec"
@@ -24,13 +25,15 @@ class HookEvent(Enum):
 
 class HookFailMode(Enum):
     """What to do when a hook raises an exception."""
-    SKIP = "skip"     # Log warning, continue to next hook
-    RAISE = "raise"   # Propagate the exception
+
+    SKIP = "skip"  # Log warning, continue to next hook
+    RAISE = "raise"  # Propagate the exception
 
 
 @dataclass
 class HookContext:
     """Context passed to hooks on execution."""
+
     event: HookEvent
     data: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
@@ -44,7 +47,7 @@ class HookContext:
 
     @property
     def iteration(self) -> int:
-        return self.data.get("iteration", 0)
+        return self.data.get("iteration") or 0
 
     @property
     def tool_name(self) -> str | None:
@@ -68,22 +71,24 @@ class HookContext:
 
     @property
     def is_error(self) -> bool:
-        return self.data.get("is_error", False)
+        return self.data.get("is_error") or False
 
     @property
     def error(self) -> Any:
         return self.data.get("error")
 
 
-# Events that support blocking (returning False stops execution)
-BLOCKING_EVENTS: frozenset[HookEvent] = frozenset({
-    HookEvent.BEFORE_LLM_CALL,
-    HookEvent.BEFORE_TOOL_EXEC,
-})
+# Events that support blocking
+BLOCKING_EVENTS: frozenset[HookEvent] = frozenset(
+    {
+        HookEvent.BEFORE_LLM_CALL,
+        HookEvent.BEFORE_TOOL_EXEC,
+    }
+)
 
 
 class Hook(ABC):
-    """Base class for hooks. Return False from handle() to block on blocking events."""
+    """Base class for hooks that can mark a blocking event as denied."""
 
     name: str = ""
     description: str = ""
@@ -94,7 +99,7 @@ class Hook(ABC):
         # Subscribed events -- subclasses override or set explicitly.
         # If the subclass defines its own `events`, respect it;
         # otherwise default to all events.
-        if 'events' not in type(self).__dict__:
+        if "events" not in type(self).__dict__:
             self.events: list[HookEvent] = list(HookEvent)
 
     @abstractmethod
@@ -162,12 +167,22 @@ class HookExecutor:
 
             try:
                 result = await hook.handle(ctx)
-                if result.blocked and is_blocking:
-                    return ctx  # Short-circuit on blocking event
+                if not isinstance(result, HookContext):
+                    raise TypeError("Hook must return a HookContext")
+                ctx = result
+                if ctx.blocked and is_blocking:
+                    return ctx
             except Exception as e:
                 if self.fail_mode == HookFailMode.RAISE:
                     raise
-                logger.warning("Hook %s failed on %s: %s", hook.name, event.value, e)
-                continue
+                logger.warning(
+                    "Hook %s failed on %s (%s)",
+                    hook.name,
+                    event.value,
+                    type(e).__name__,
+                )
+                if is_blocking:
+                    ctx.blocked = True
+                    return ctx
 
         return ctx

@@ -1,4 +1,5 @@
 """Unit tests for sanityops_agent.tools.builtins.todo - TodoTool"""
+
 from __future__ import annotations
 
 import asyncio
@@ -78,9 +79,7 @@ class TestTodoToolUpdate:
         tool = TodoTool(context=ctx)
 
         result = _run(
-            tool.execute(
-                operation="update", todo_id="nonexistent", status="completed"
-            )
+            tool.execute(operation="update", todo_id="nonexistent", status="completed")
         )
         assert result.success is False
         assert "not found" in result.content
@@ -154,9 +153,7 @@ class TestTodoToolListByStatus:
         ctx.set("todo_manager", mgr)
         tool = TodoTool(context=ctx)
 
-        result = _run(
-            tool.execute(operation="list_by_status", status="completed")
-        )
+        result = _run(tool.execute(operation="list_by_status", status="completed"))
         assert result.success is True
         assert "No todos with status 'completed'" in result.content
 

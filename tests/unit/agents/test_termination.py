@@ -2,6 +2,7 @@
 
 Following TDD: tests written first, verified failing, then implementation added.
 """
+
 from __future__ import annotations
 
 import time
@@ -28,20 +29,23 @@ from sanityops_agent.core.message import (
 # Concrete test subclass of BaseAgent
 # ---------------------------------------------------------------------------
 
+
 class DummyResponse:
     """Mock LLM response for testing."""
 
-    def __init__(self, stop_reason: FinishReason = FinishReason.END_TURN,
-                 has_tool_calls: bool = False, tool_calls: list | None = None,
-                 text: str = "hello", content: list | None = None,
-                 model: str = "test-model", provider: str = "test"):
+    def __init__(
+        self,
+        stop_reason: FinishReason = FinishReason.END_TURN,
+        has_tool_calls: bool = False,
+        tool_calls: list | None = None,
+        text: str = "hello",
+        content: list | None = None,
+    ):
         self.stop_reason = stop_reason
         self.has_tool_calls = has_tool_calls
         self._tool_calls = tool_calls or []
         self._text = text
         self.content = content if content is not None else [TextBlock(text=text)]
-        self.model = model
-        self.provider = provider
 
     def get_tool_calls(self):
         return self._tool_calls
@@ -71,6 +75,7 @@ class ConcreteAgent(BaseAgent):
 # TerminationReason enum tests
 # ===========================================================================
 
+
 class TestTerminationReason:
     def test_all_values_exist(self):
         assert TerminationReason.END_TURN.value == "end_turn"
@@ -87,6 +92,7 @@ class TestTerminationReason:
 # ===========================================================================
 # AgentConfig tests
 # ===========================================================================
+
 
 class TestAgentConfig:
     def test_defaults(self):
@@ -125,6 +131,7 @@ class TestAgentConfig:
 # AgentError tests
 # ===========================================================================
 
+
 class TestAgentError:
     def test_basic_construction(self):
         err = AgentError(
@@ -153,6 +160,7 @@ class TestAgentError:
 # ===========================================================================
 # AgentResult tests
 # ===========================================================================
+
 
 class TestAgentResult:
     def test_construction(self):
@@ -190,6 +198,7 @@ class TestAgentResult:
 # BaseAgent _check_termination_conditions tests
 # ===========================================================================
 
+
 class TestCheckTerminationConditions:
     @pytest.mark.asyncio
     async def test_no_termination_when_within_limits(self):
@@ -220,6 +229,7 @@ class TestCheckTerminationConditions:
 # ===========================================================================
 # BaseAgent _build_result tests
 # ===========================================================================
+
 
 class TestBuildResult:
     @pytest.mark.asyncio
@@ -254,7 +264,9 @@ class TestBuildResult:
         agent.tokens_used = 0
         agent.start_time = time.time()
 
-        result = agent._build_result(TerminationReason.ERROR, 0, error="Connection failed")
+        result = agent._build_result(
+            TerminationReason.ERROR, 0, error="Connection failed"
+        )
 
         assert result.error == "Connection failed"
         assert result.termination_reason == TerminationReason.ERROR
@@ -275,6 +287,7 @@ class TestBuildResult:
 # ===========================================================================
 # BaseAgent _record_error tests
 # ===========================================================================
+
 
 class TestRecordError:
     def test_record_single_error(self):
@@ -298,7 +311,9 @@ class TestRecordError:
 
     def test_record_error_with_tool_name(self):
         agent = ConcreteAgent(AgentConfig())
-        agent._record_error("tool_error", "File missing", 0, tool_name="read_file", recoverable=True)
+        agent._record_error(
+            "tool_error", "File missing", 0, tool_name="read_file", recoverable=True
+        )
         err = agent._errors[0]
         assert err.tool_name == "read_file"
         assert err.recoverable is True
@@ -319,6 +334,7 @@ class TestRecordError:
 # ===========================================================================
 # BaseAgent.run() loop termination tests
 # ===========================================================================
+
 
 class TestRunLoopTermination:
     """Test that the main loop terminates correctly under various response patterns."""

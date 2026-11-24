@@ -86,6 +86,7 @@ class TestToolHistoryStoreGet:
     @pytest.mark.asyncio
     async def test_get_preserves_timestamp(self):
         import time
+
         store = ToolHistoryStore()
         before = time.time()
         key = await store.store("search", "results", tool_call_id="c2")
@@ -124,7 +125,11 @@ class TestToolHistoryStoreConcurrent:
 
         async def store_many(prefix, count):
             for i in range(count):
-                await store.store(f"tool_{prefix}", f"content_{prefix}_{i}", tool_call_id=f"{prefix}_{i}")
+                await store.store(
+                    f"tool_{prefix}",
+                    f"content_{prefix}_{i}",
+                    tool_call_id=f"{prefix}_{i}",
+                )
 
         # Run two concurrent store tasks
         await asyncio.gather(
@@ -154,3 +159,15 @@ class TestToolHistoryStoreConcurrent:
         await asyncio.gather(producer(), consumer())
         # At least some entries should be retrievable
         # (consumer may run before all producers finish)
+
+
+def test_truncation_is_logged(caplog):
+    async def run():
+        store = ToolHistoryStore(max_entry_chars=10)
+        with caplog.at_level("WARNING", logger="sanityops_agent.managers.history"):
+            key = await store.store("tool", "x" * 50)
+        entry = await store.get(key)
+        assert entry.content == "x" * 10
+        assert "truncated" in caplog.text
+
+    asyncio.run(run())

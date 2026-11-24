@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from sanityops_agent.managers._files import write_private_json
 
 
 @dataclass
@@ -16,7 +17,7 @@ class TodoItem:
 class TodoManager:
     """Unique ID generation, batch event processing, status query, persistence"""
 
-    def __init__(self, persist_path: str | None = None):
+    def __init__(self, persist_path: str | Path | None = None):
         self._todos: list[TodoItem] = []
         self._persist_path = Path(persist_path) if persist_path else None
 
@@ -50,4 +51,4 @@ class TodoManager:
     def _persist(self):
         if self._persist_path:
             data = [asdict(t) for t in self._todos]
-            self._persist_path.write_text(json.dumps(data, indent=2))
+            write_private_json(self._persist_path, data)

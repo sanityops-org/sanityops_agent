@@ -9,6 +9,7 @@ import pytest
 
 from sanityops_agent.core.message import (
     ContentType,
+    ErrorBlock,
     FinishReason,
     Message,
     Role,
@@ -20,7 +21,7 @@ from sanityops_agent.core.message import (
     ToolUseBlock,
 )
 from sanityops_agent.llm.adapters.anthropic_adapter import AnthropicAdapter
-from sanityops_agent.llm.adapters.base import MessageAdapter
+from sanityops_agent.llm.adapters.base import MessageAdapter, merge_consecutive_messages
 from sanityops_agent.llm.adapters.openai_adapter import OpenAIAdapter
 from sanityops_agent.llm.base import LLMResponse
 from sanityops_agent.llm.exceptions import (
@@ -30,6 +31,33 @@ from sanityops_agent.llm.exceptions import (
     ProviderUnavailableError,
     RateLimitError,
 )
+
+
+def _parallel_tool_history() -> list[Message]:
+    """The malformed history the agent loop produces for 2 parallel tool calls.
+
+    One assistant turn with two tool_use blocks, followed by one USER message
+    per tool result (see agents/parent.py:_add_tool_result). Emitted verbatim
+    this is consecutive same-role messages -> provider HTTP 400.
+    """
+    return [
+        Message(
+            role=Role.ASSISTANT,
+            content=[
+                ToolUseBlock(tool_call_id="c1", tool_name="t", tool_input={}),
+                ToolUseBlock(tool_call_id="c2", tool_name="t", tool_input={}),
+            ],
+        ),
+        Message(
+            role=Role.USER,
+            content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+        ),
+        Message(
+            role=Role.USER,
+            content=[ToolResultBlock(tool_call_id="c2", tool_result_content="r2")],
+        ),
+    ]
+
 
 # ====================================================================
 # MessageAdapter abstractness
@@ -153,7 +181,10 @@ class TestAnthropicAdapterToolUse:
         tool_def = ToolDefinition(
             name="search",
             description="Search the web",
-            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
         )
         messages = [Message.from_text(Role.USER, "Search for cats")]
         result = adapter.to_provider(messages, tools=[tool_def])
@@ -161,6 +192,168 @@ class TestAnthropicAdapterToolUse:
         assert len(result["tools"]) == 1
         assert result["tools"][0]["name"] == "search"
         assert result["tools"][0]["description"] == "Search the web"
+
+
+class TestAnthropicAdapterConsecutiveMessages:
+    """Consecutive same-role messages must be merged (Anthropic 400 fix)."""
+
+    @pytest.fixture
+    def adapter(self):
+        return AnthropicAdapter()
+
+    def test_parallel_tool_results_merge_into_single_user_message(
+        self, adapter: AnthropicAdapter
+    ):
+        out = adapter.to_provider(_parallel_tool_history())
+        messages = out["messages"]
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "assistant"
+        assert messages[1]["role"] == "user"
+
+        # No two consecutive entries may share a role.
+        roles = [m["role"] for m in messages]
+        assert all(a != b for a, b in zip(roles, roles[1:], strict=False))
+
+        content = messages[1]["content"]
+        assert [b["type"] for b in content] == ["tool_result", "tool_result"]
+        assert [b["tool_use_id"] for b in content] == ["c1", "c2"]
+
+    def test_tool_result_ordered_before_text(self, adapter: AnthropicAdapter):
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="note")]),
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+        ]
+        content = adapter.to_provider(history)["messages"][0]["content"]
+
+        assert content[0]["type"] == "tool_result"
+        assert content[0]["tool_use_id"] == "c1"
+        assert content[1] == {"type": "text", "text": "note"}
+
+    def test_tool_result_ordered_before_text_reversed_input(
+        self, adapter: AnthropicAdapter
+    ):
+        history = [
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+            Message(role=Role.USER, content=[TextBlock(text="note")]),
+        ]
+        content = adapter.to_provider(history)["messages"][0]["content"]
+
+        assert content[0]["type"] == "tool_result"
+        assert content[1] == {"type": "text", "text": "note"}
+
+    def test_empty_assistant_placeholder_dropped(self, adapter: AnthropicAdapter):
+        history = [
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolUseBlock(tool_call_id="c1", tool_name="t", tool_input={})],
+            ),
+            Message(role=Role.ASSISTANT, content=[]),  # sub.py placeholder
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+        ]
+        out = adapter.to_provider(history)
+        messages = out["messages"]
+
+        assert [m["role"] for m in messages] == ["assistant", "user"]
+        assert all(m["content"] for m in messages)
+        assert messages[0]["content"][0]["type"] == "tool_use"
+
+    def test_empty_message_dropped(self, adapter: AnthropicAdapter):
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="hi")]),
+            Message(role=Role.ASSISTANT, content=[]),
+        ]
+        out = adapter.to_provider(history)
+
+        assert len(out["messages"]) == 1
+
+    def test_message_converting_to_empty_content_is_skipped(
+        self, adapter: AnthropicAdapter
+    ):
+        # An ErrorBlock has no Anthropic wire form; the message would otherwise
+        # emit an empty content array, which the API rejects.
+        history = [
+            Message.from_text(Role.USER, "hello"),
+            Message(
+                role=Role.ASSISTANT,
+                content=[ErrorBlock(error_code="x", error_message="boom")],
+            ),
+        ]
+        out = adapter.to_provider(history)
+
+        assert [m["role"] for m in out["messages"]] == ["user"]
+        assert all(m["content"] for m in out["messages"])
+
+    def test_no_consecutive_roles_when_middle_message_converts_to_nothing(
+        self, adapter: AnthropicAdapter
+    ):
+        # The ErrorBlock assistant message converts to no wire blocks and is
+        # skipped AFTER coalescing; the surrounding user messages must not end
+        # up adjacent in the emitted payload.
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="hi")]),
+            Message(
+                role=Role.ASSISTANT,
+                content=[ErrorBlock(error_code="x", error_message="boom")],
+            ),
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r")],
+            ),
+        ]
+        out = adapter.to_provider(history)["messages"]
+
+        roles = [m["role"] for m in out]
+        assert all(a != b for a, b in zip(roles, roles[1:], strict=False))
+        assert roles == ["user"]
+
+    def test_user_and_tool_messages_coalesce(self, adapter: AnthropicAdapter):
+        # Role.USER and Role.TOOL both emit role:"user", so adjacent ones must
+        # merge even though the internal roles differ.
+        history = [
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolUseBlock(tool_call_id="c1", tool_name="t", tool_input={})],
+            ),
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+            Message(
+                role=Role.TOOL,
+                content=[ToolResultBlock(tool_call_id="c2", tool_result_content="r2")],
+            ),
+        ]
+        out = adapter.to_provider(history)["messages"]
+
+        assert [m["role"] for m in out] == ["assistant", "user"]
+        assert [b["tool_use_id"] for b in out[1]["content"]] == ["c1", "c2"]
+
+    def test_no_merge_across_role_boundary(self, adapter: AnthropicAdapter):
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="hi")]),
+            Message(role=Role.ASSISTANT, content=[TextBlock(text="ok")]),
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+        ]
+        out = adapter.to_provider(history)
+
+        assert [m["role"] for m in out["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
 
 
 # ====================================================================
@@ -188,7 +381,11 @@ class TestAnthropicAdapterFromResponse:
         assert result.content[0].text == "Hello world"
         assert result.stop_reason == FinishReason.END_TURN
         assert result.model == "claude-3-5-sonnet"
-        assert result.usage == {"input_tokens": 10, "output_tokens": 5}
+        assert result.usage == {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+        }
 
     def test_parse_tool_use_response(self, adapter: AnthropicAdapter):
         response = {
@@ -286,31 +483,86 @@ class TestAnthropicAdapterStreaming:
         result = adapter.from_provider_chunk(chunk)
 
         assert result.finish_reason == FinishReason.END_TURN
-        assert result.usage is None
 
-    def test_message_delta_with_usage(self, adapter: AnthropicAdapter):
-        """Anthropic reports token usage on the final message_delta event."""
-        chunk = {
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn"},
-            "usage": {"input_tokens": 10, "output_tokens": 42},
-        }
-        result = adapter.from_provider_chunk(chunk)
 
-        assert result.finish_reason == FinishReason.END_TURN
-        assert result.usage == {"input_tokens": 10, "output_tokens": 42}
+class TestAnthropicAdapterSdkStreamEvent:
+    """from_sdk_stream_event: the typed path AnthropicProvider.stream() uses.
 
-    def test_message_delta_usage_only(self, adapter: AnthropicAdapter):
-        """A usage report with no stop reason still surfaces the usage."""
-        chunk = {
-            "type": "message_delta",
-            "delta": {},
-            "usage": {"input_tokens": 5, "output_tokens": 7},
-        }
-        result = adapter.from_provider_chunk(chunk)
+    Real streams yield raw content_block_* events; the SDK also yields parsed
+    convenience events (text/thinking/input_json) with the same payloads, which
+    must NOT also be handled or every fragment is emitted twice.
+    """
 
-        assert result.finish_reason is None
-        assert result.usage == {"input_tokens": 5, "output_tokens": 7}
+    @pytest.fixture
+    def adapter(self):
+        return AnthropicAdapter()
+
+    @staticmethod
+    def _start(index: int, block_type: str, **fields):
+        from anthropic.types import RawContentBlockStartEvent
+
+        return RawContentBlockStartEvent(
+            type="content_block_start",
+            index=index,
+            content_block={"type": block_type, **fields},
+        )
+
+    @staticmethod
+    def _delta(index: int, delta):
+        from anthropic.types import RawContentBlockDeltaEvent
+
+        return RawContentBlockDeltaEvent(
+            type="content_block_delta", index=index, delta=delta
+        )
+
+    def test_tool_use_start_carries_name_id_and_index(self, adapter: AnthropicAdapter):
+        """The tool name is only available on the start event."""
+        from anthropic.types import ToolUseBlock
+
+        event = self._start(1, "tool_use", id="call_1", name="calculator", input={})
+        assert isinstance(event.content_block, ToolUseBlock)
+        result = adapter.from_sdk_stream_event(event)
+
+        assert result.type == ContentType.TOOL_USE
+        assert result.tool_call_id == "call_1"
+        assert result.delta == {"name": "calculator", "input": {}}
+        assert result.index == 1
+
+    def test_input_json_delta_uses_matching_index(self, adapter: AnthropicAdapter):
+        """Arguments must carry the same index as the start event, else the
+        consumer opens a second buffer and loses the name."""
+        from anthropic.types import InputJSONDelta
+
+        result = adapter.from_sdk_stream_event(
+            self._delta(1, InputJSONDelta(type="input_json_delta", partial_json='{"a"'))
+        )
+
+        assert result.type == ContentType.TOOL_USE
+        assert result.delta == {"arguments": '{"a"'}
+        assert result.index == 1
+        assert result.tool_call_id is None
+
+    def test_text_delta_via_raw_event(self, adapter: AnthropicAdapter):
+        from anthropic.types import TextDelta
+
+        result = adapter.from_sdk_stream_event(
+            self._delta(0, TextDelta(type="text_delta", text="Hello"))
+        )
+
+        assert result.type == ContentType.TEXT
+        assert result.delta == "Hello"
+
+    def test_parsed_convenience_events_are_ignored(self, adapter: AnthropicAdapter):
+        """text/thinking/input_json events duplicate the raw events above."""
+        from anthropic.lib.streaming import InputJsonEvent, TextEvent
+
+        text_event = TextEvent(type="text", text="Hello", snapshot="Hello")
+        assert adapter.from_sdk_stream_event(text_event) is None
+
+        json_event = InputJsonEvent(
+            type="input_json", partial_json='{"a"', snapshot='{"a"'
+        )
+        assert adapter.from_sdk_stream_event(json_event) is None
 
 
 # ====================================================================
@@ -450,6 +702,113 @@ class TestOpenAIAdapterToolUse:
         assert tool_msg["tool_call_id"] == "call_xyz"
         assert tool_msg["content"] == "Sunny"
 
+
+class TestOpenAIAdapterConsecutiveMessages:
+    """Empty placeholders dropped; N results stay N role:tool messages."""
+
+    @pytest.fixture
+    def adapter(self):
+        return OpenAIAdapter()
+
+    def test_parallel_tool_results_become_sequential_tool_messages(
+        self, adapter: OpenAIAdapter
+    ):
+        out = adapter.to_provider(_parallel_tool_history())
+        messages = out["messages"]
+
+        assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
+        assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["c1", "c2"]
+        assert messages[1]["tool_call_id"] == "c1"
+        assert messages[1]["content"] == "r1"
+        assert messages[2]["tool_call_id"] == "c2"
+        assert messages[2]["content"] == "r2"
+
+    def test_empty_assistant_placeholder_dropped(self, adapter: OpenAIAdapter):
+        history = [
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolUseBlock(tool_call_id="c1", tool_name="t", tool_input={})],
+            ),
+            Message(role=Role.ASSISTANT, content=[]),  # sub.py placeholder
+            Message(
+                role=Role.USER,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+        ]
+        out = adapter.to_provider(history)
+        messages = out["messages"]
+
+        assert [m["role"] for m in messages] == ["assistant", "tool"]
+        assert not any(
+            m["role"] == "assistant" and not m.get("tool_calls") for m in messages
+        )
+
+    def test_consecutive_assistant_messages_merged(self, adapter: OpenAIAdapter):
+        history = [
+            Message(role=Role.ASSISTANT, content=[TextBlock(text="ok")]),
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolUseBlock(tool_call_id="c1", tool_name="t", tool_input={})],
+            ),
+        ]
+        out = adapter.to_provider(history)
+        messages = out["messages"]
+
+        assert len(messages) == 1
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["content"] == [{"type": "text", "text": "ok"}]
+        assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["c1"]
+
+    def test_consecutive_user_messages_not_merged(self, adapter: OpenAIAdapter):
+        # Deliberate asymmetry with Anthropic: each user tool-result message
+        # must stay its own role:tool message.
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="a")]),
+            Message(role=Role.USER, content=[TextBlock(text="b")]),
+        ]
+        out = adapter.to_provider(history)
+
+        assert [m["role"] for m in out["messages"]] == ["user", "user"]
+
+    def test_unconvertible_assistant_not_emitted_as_empty(self, adapter: OpenAIAdapter):
+        # An ErrorBlock-only assistant message must not become
+        # {"role":"assistant","content":""}, which is invalid between
+        # tool_calls and its results.
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="hi")]),
+            Message(
+                role=Role.ASSISTANT,
+                content=[ErrorBlock(error_code="x", error_message="boom")],
+            ),
+        ]
+        out = adapter.to_provider(history)["messages"]
+
+        assert [m["role"] for m in out] == ["user"]
+        assert all(m["role"] != "assistant" for m in out)
+
+    def test_assistant_tool_results_kept_alongside_other_blocks(
+        self, adapter: OpenAIAdapter
+    ):
+        # A tool_result in an assistant message must still become role:"tool"
+        # even when the same message carries a tool_use, otherwise the matching
+        # tool_call_id is orphaned.
+        history = [
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolResultBlock(tool_call_id="c1", tool_result_content="r1")],
+            ),
+            Message(
+                role=Role.ASSISTANT,
+                content=[ToolUseBlock(tool_call_id="c2", tool_name="t", tool_input={})],
+            ),
+        ]
+        out = adapter.to_provider(history)["messages"]
+
+        tool_msgs = [m for m in out if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tool_msgs] == ["c1"]
+        assert tool_msgs[0]["content"] == "r1"
+        assert any(m.get("tool_calls") for m in out)
+
     def test_tools_parameter(self, adapter: OpenAIAdapter):
         tool_def = ToolDefinition(
             name="search",
@@ -461,6 +820,75 @@ class TestOpenAIAdapterToolUse:
 
         assert result["tools"][0]["type"] == "function"
         assert result["tools"][0]["function"]["name"] == "search"
+
+
+# ====================================================================
+# merge_consecutive_messages helper
+# ====================================================================
+
+
+class TestMergeConsecutiveMessages:
+    def test_empty_messages_dropped(self):
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="hi")]),
+            Message(role=Role.ASSISTANT, content=[]),
+            Message(role=Role.USER, content=[TextBlock(text="bye")]),
+        ]
+        out = merge_consecutive_messages(history, frozenset({Role.USER}))
+
+        # The empty assistant is dropped, leaving the two user messages
+        # adjacent, so they merge into one.
+        assert [m.role for m in out] == [Role.USER]
+        assert [b.text for b in out[0].content] == ["hi", "bye"]
+
+    def test_no_merge_across_role_boundary(self):
+        history = [
+            Message(role=Role.USER, content=[TextBlock(text="a")]),
+            Message(role=Role.ASSISTANT, content=[TextBlock(text="b")]),
+            Message(role=Role.USER, content=[TextBlock(text="c")]),
+        ]
+        out = merge_consecutive_messages(
+            history, frozenset({Role.USER, Role.ASSISTANT})
+        )
+
+        assert [m.role for m in out] == [Role.USER, Role.ASSISTANT, Role.USER]
+
+    def test_only_listed_roles_are_merged(self):
+        history = [
+            Message(role=Role.ASSISTANT, content=[TextBlock(text="a")]),
+            Message(role=Role.ASSISTANT, content=[TextBlock(text="b")]),
+        ]
+        out = merge_consecutive_messages(history, frozenset({Role.USER}))
+
+        assert [m.role for m in out] == [Role.ASSISTANT, Role.ASSISTANT]
+
+    def test_merge_is_pure_and_idempotent(self):
+        history = _parallel_tool_history()
+        before = [len(m.content) for m in history]
+        before_ids = [id(m.content) for m in history]
+
+        out = merge_consecutive_messages(
+            history, frozenset({Role.USER, Role.ASSISTANT})
+        )
+
+        # Inputs untouched: same block counts, same content-list objects.
+        assert [len(m.content) for m in history] == before
+        assert [id(m.content) for m in history] == before_ids
+
+        # Idempotent: a second pass over the output changes nothing.
+        again = merge_consecutive_messages(out, frozenset({Role.USER, Role.ASSISTANT}))
+        assert [(m.role, m.content) for m in again] == [
+            (m.role, m.content) for m in out
+        ]
+
+    def test_blocks_shared_by_reference(self):
+        # Merging copies the list, not the blocks: adapters only read them.
+        history = _parallel_tool_history()
+        out = merge_consecutive_messages(
+            history, frozenset({Role.USER, Role.ASSISTANT})
+        )
+        assert out[1].content[0] is history[1].content[0]
+        assert out[1].content[1] is history[2].content[0]
 
 
 # ====================================================================
@@ -492,7 +920,11 @@ class TestOpenAIAdapterFromResponse:
         assert result.content[0].text == "Hello world"
         assert result.stop_reason == FinishReason.STOP
         assert result.model == "gpt-4o"
-        assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+        assert result.usage == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        }
 
     def test_parse_tool_use_response(self, adapter: OpenAIAdapter):
         response = {
@@ -672,7 +1104,169 @@ class TestOpenAIAdapterMapException:
         return exc_cls(msg)
 
 
-# ====================================================================
+class TestOpenAIAdapterFlattenWarning:
+    """Flattening a multi-block user message degrades structure; it must be
+    visible via a warning log."""
+
+    def test_flatten_logs_warning(self, caplog):
+        adapter = OpenAIAdapter()
+        history = [
+            Message(
+                role=Role.USER,
+                content=[TextBlock(text="part one"), TextBlock(text="part two")],
+            )
+        ]
+        with caplog.at_level(
+            "WARNING", logger="sanityops_agent.llm.adapters.openai_adapter"
+        ):
+            out = adapter.to_provider(history)
+
+        assert out["messages"][0]["content"] == "part one\npart two"
+        assert any("Flattening" in r.message for r in caplog.records)
+
+
+class TestExceptionMappingOverloaded:
+    """OverloadedError (529) means the provider is busy: it must map to a
+    recoverable ProviderUnavailableError, not a generic LLMError."""
+
+    def test_anthropic_overloaded_maps_to_provider_unavailable(self):
+        class OverloadedError(Exception):
+            pass
+
+        mapped = AnthropicAdapter.map_exception(OverloadedError("overloaded"))
+        assert isinstance(mapped, ProviderUnavailableError)
+
+    def test_openai_overloaded_maps_to_provider_unavailable(self):
+        class OverloadedError(Exception):
+            pass
+
+        mapped = OpenAIAdapter.map_exception(OverloadedError("overloaded"))
+        assert isinstance(mapped, ProviderUnavailableError)
+
+
+class TestOpenAIAdapterToolInputSerialization:
+    def test_non_serializable_tool_input_is_stringified(self):
+        adapter = OpenAIAdapter()
+        history = [
+            Message(
+                role=Role.ASSISTANT,
+                content=[
+                    ToolUseBlock(
+                        tool_call_id="c1",
+                        tool_name="t",
+                        tool_input={"bad": object()},
+                    )
+                ],
+            )
+        ]
+        out = adapter.to_provider(history)["messages"]
+
+        args = out[0]["tool_calls"][0]["function"]["arguments"]
+        assert "raw" in json.loads(args)
+
+
+class TestToolsToProviderStrictness:
+    """OpenAI strictness must be explicitly requested."""
+
+    def test_openai_strict_defaults_false(self):
+        adapter = OpenAIAdapter()
+        td = ToolDefinition(
+            name="t", description="d", input_schema={"type": "object", "properties": {}}
+        )
+        out = adapter.tools_to_provider([td])[0]
+        assert out["function"].get("strict", False) is False
+
+    def test_openai_strict_opt_out_via_provider_config(self):
+        adapter = OpenAIAdapter()
+        td = ToolDefinition(
+            name="t",
+            description="d",
+            input_schema={"type": "object", "properties": {}},
+            provider_config={"strict": False},
+        )
+        out = adapter.tools_to_provider([td])[0]
+        assert out["function"]["strict"] is False
+
+    def test_openai_additional_properties_preserved(self):
+        adapter = OpenAIAdapter()
+        td = ToolDefinition(
+            name="t",
+            description="d",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {"type": "string"},
+            },
+        )
+        out = adapter.tools_to_provider([td])[0]
+        assert out["function"]["parameters"]["additionalProperties"] == {
+            "type": "string"
+        }
+
+    def test_openai_additional_properties_defaults_false(self):
+        adapter = OpenAIAdapter()
+        td = ToolDefinition(
+            name="t", description="d", input_schema={"type": "object", "properties": {}}
+        )
+        out = adapter.tools_to_provider([td])[0]
+        assert out["function"]["parameters"]["additionalProperties"] is False
+
+    def test_anthropic_strict_opt_out_via_provider_config(self):
+        adapter = AnthropicAdapter()
+        td = ToolDefinition(
+            name="t",
+            description="d",
+            input_schema={"type": "object", "properties": {}},
+            provider_config={"strict": False},
+        )
+        out = adapter.tools_to_provider([td])[0]
+        assert out["strict"] is False
+
+
+class TestContextWindowMapping:
+    """Context-window errors must be recognized structurally where possible."""
+
+    @staticmethod
+    def _bad_request(message: str, status: int | None):
+        class BadRequestError(Exception):
+            pass
+
+        exc = BadRequestError(message)
+        if status is not None:
+            exc.response = type("R", (), {"status_code": status})()
+        return exc
+
+    def test_anthropic_context_window_with_400(self):
+        exc = self._bad_request("prompt is too long", 400)
+        mapped = AnthropicAdapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_anthropic_context_window_without_response_attr(self):
+        exc = self._bad_request("prompt is too long", None)
+        mapped = AnthropicAdapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_anthropic_non_context_bad_request_not_misclassified(self):
+        exc = self._bad_request("invalid model", 400)
+        mapped = AnthropicAdapter.map_exception(exc)
+        assert not isinstance(mapped, ContextWindowExceededError)
+
+    def test_openai_context_window_with_400(self):
+        exc = self._bad_request("maximum context length exceeded", 400)
+        mapped = OpenAIAdapter.map_exception(exc)
+        assert isinstance(mapped, ContextWindowExceededError)
+
+    def test_openai_non_context_bad_request_not_misclassified(self):
+        exc = self._bad_request("invalid api key format", 400)
+        mapped = OpenAIAdapter.map_exception(exc)
+        assert not isinstance(mapped, ContextWindowExceededError)
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter tests
+# ---------------------------------------------------------------------------
+
+
 # GeminiAdapter – text message conversion
 # ====================================================================
 
@@ -681,6 +1275,7 @@ class TestGeminiAdapterText:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter()
 
     def test_single_user_text_message(self, adapter):
@@ -731,6 +1326,7 @@ class TestGeminiAdapterToolUse:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter()
 
     def test_tool_use_block_conversion(self, adapter):
@@ -794,7 +1390,10 @@ class TestGeminiAdapterToolUse:
         tool_def = ToolDefinition(
             name="search",
             description="Search the web",
-            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
         )
         messages = [Message.from_text(Role.USER, "Search for cats")]
         result = adapter.to_provider(messages, tools=[tool_def])
@@ -805,17 +1404,21 @@ class TestGeminiAdapterToolUse:
 
     def test_parse_tool_use_response(self, adapter):
         response = {
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "name": "search",
-                            "args": {"query": "test"},
-                        }
-                    }]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "search",
+                                    "args": {"query": "test"},
+                                }
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-3.5-flash-lite",
         }
         result = adapter.from_provider_response(response)
@@ -836,16 +1439,11 @@ class TestGeminiAdapterStreaming:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter(store_thinking=True)
 
     def test_text_delta(self, adapter):
-        chunk = {
-            "candidates": [{
-                "content": {
-                    "parts": [{"text": "Hello"}]
-                }
-            }]
-        }
+        chunk = {"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}
         result = adapter.from_provider_chunk(chunk)
 
         assert result.type == ContentType.TEXT
@@ -854,11 +1452,9 @@ class TestGeminiAdapterStreaming:
     def test_thinking_delta(self, adapter):
         # Real Gemini thought parts carry BOTH text and thought=True
         chunk = {
-            "candidates": [{
-                "content": {
-                    "parts": [{"text": "Let me think...", "thought": True}]
-                }
-            }]
+            "candidates": [
+                {"content": {"parts": [{"text": "Let me think...", "thought": True}]}}
+            ]
         }
         result = adapter.from_provider_chunk(chunk)
 
@@ -867,17 +1463,20 @@ class TestGeminiAdapterStreaming:
 
     def test_thinking_not_stored(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         adapter = GeminiAdapter(store_thinking=False)
         response = {
-            "candidates": [{
-                "content": {
-                    "parts": [
-                        {"text": "Hmm...", "thought": True},
-                        {"text": "The answer is 42"},
-                    ]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "Hmm...", "thought": True},
+                            {"text": "The answer is 42"},
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-3.5-flash-lite",
         }
         result = adapter.from_provider_response(response)
@@ -889,16 +1488,20 @@ class TestGeminiAdapterStreaming:
 
     def test_tool_call_delta(self, adapter):
         chunk = {
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "name": "search",
-                            "args": {"query": "test"},
-                        }
-                    }]
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "search",
+                                    "args": {"query": "test"},
+                                }
+                            }
+                        ]
+                    }
                 }
-            }]
+            ]
         }
         result = adapter.from_provider_chunk(chunk)
 
@@ -908,10 +1511,7 @@ class TestGeminiAdapterStreaming:
 
     def test_finish_reason(self, adapter):
         chunk = {
-            "candidates": [{
-                "finishReason": "MAX_TOKENS",
-                "content": {"parts": []}
-            }]
+            "candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": []}}]
         }
         result = adapter.from_provider_chunk(chunk)
 
@@ -927,6 +1527,7 @@ class TestGeminiAdapterMapException:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter()
 
     def test_authentication_error_401(self, adapter):
@@ -965,7 +1566,9 @@ class TestGeminiAdapterMapException:
 
     def test_context_window_exceeded_error(self, adapter):
         """400 status with 'context' in message should map to ContextWindowExceededError."""
-        exc = self._fake_api_error(400, "Request payload size exceeds the limit: context window exceeded")
+        exc = self._fake_api_error(
+            400, "Request payload size exceeds the limit: context window exceeded"
+        )
         mapped = adapter.map_exception(exc)
         assert isinstance(mapped, ContextWindowExceededError)
 
@@ -1040,13 +1643,14 @@ class TestGeminiAdapterThoughtSignature:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter(store_thinking=True, model_id="gemini-2.5-flash")
 
     def test_thinking_block_with_signature_same_model(self, adapter):
         """When same provider/model, thoughtSignature should be preserved."""
         thinking = ThinkingBlock(
             thinking="Let me think...",
-            thinking_signature="abc123==",
+            signature="abc123==",
         )
         msg = Message(
             role=Role.ASSISTANT,
@@ -1069,7 +1673,7 @@ class TestGeminiAdapterThoughtSignature:
         """Cross-model thinking block should convert to plain text, no signature."""
         thinking = ThinkingBlock(
             thinking="Let me think...",
-            thinking_signature="abc123==",
+            signature="abc123==",
         )
         msg = Message(
             role=Role.ASSISTANT,
@@ -1138,16 +1742,20 @@ class TestGeminiAdapterThoughtSignature:
     def test_from_provider_response_extracts_thinking_signature(self, adapter):
         """Response parsing should extract thoughtSignature."""
         response = {
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "thought": True,
-                        "text": "Hmm...",
-                        "thoughtSignature": "respSig==",
-                    }]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "thought": True,
+                                "text": "Hmm...",
+                                "thoughtSignature": "respSig==",
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-2.5-flash",
         }
         result = adapter.from_provider_response(response)
@@ -1156,20 +1764,24 @@ class TestGeminiAdapterThoughtSignature:
         block = result.content[0]
         assert isinstance(block, ThinkingBlock)
         assert block.thinking == "Hmm..."
-        assert block.thinking_signature == "respSig=="
+        assert block.signature == "respSig=="
 
     def test_from_provider_response_extracts_text_signature(self, adapter):
         """Response parsing should extract thoughtSignature from text parts."""
         response = {
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "text": "The answer",
-                        "thoughtSignature": "textSig==",
-                    }]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": "The answer",
+                                "thoughtSignature": "textSig==",
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-2.5-flash",
         }
         result = adapter.from_provider_response(response)
@@ -1183,18 +1795,22 @@ class TestGeminiAdapterThoughtSignature:
     def test_from_provider_response_extracts_tool_signature(self, adapter):
         """Response parsing should extract thoughtSignature from tool calls."""
         response = {
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "name": "search",
-                            "args": {"q": "test"},
-                        },
-                        "thoughtSignature": "toolRespSig==",
-                    }]
-                },
-                "finishReason": "STOP",
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "search",
+                                    "args": {"q": "test"},
+                                },
+                                "thoughtSignature": "toolRespSig==",
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
             "modelVersion": "gemini-2.5-flash",
         }
         result = adapter.from_provider_response(response)
@@ -1209,7 +1825,7 @@ class TestGeminiAdapterThoughtSignature:
         """If message provider is None, signature should be dropped."""
         thinking = ThinkingBlock(
             thinking="Hmm...",
-            thinking_signature="sig==",
+            signature="sig==",
         )
         msg = Message(
             role=Role.ASSISTANT,
@@ -1232,7 +1848,7 @@ class TestGeminiAdapterThoughtSignature:
         """If current_model is None, signature should be dropped."""
         thinking = ThinkingBlock(
             thinking="Hmm...",
-            thinking_signature="sig==",
+            signature="sig==",
         )
         msg = Message(
             role=Role.ASSISTANT,
@@ -1262,6 +1878,7 @@ class TestGeminiAdapterToolCallIdNormalization:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter(model_id="gemini-3.5-flash")
 
     def test_normalize_special_characters(self, adapter):
@@ -1337,6 +1954,7 @@ class TestGeminiAdapterToolResultMerging:
     @pytest.fixture
     def adapter(self):
         from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
         return GeminiAdapter()
 
     def test_consecutive_tool_results_merged(self, adapter):
@@ -1408,5 +2026,135 @@ class TestGeminiAdapterToolResultMerging:
         messages = [
             Message(role=Role.ASSISTANT, content=[tool_result]),
         ]
-        with pytest.raises(ValueError, match="ToolResultBlock must be in a user-role message"):
+        with pytest.raises(
+            ValueError, match="ToolResultBlock must be in a user-role message"
+        ):
             adapter.to_provider(messages)
+
+
+class TestGeminiAdapterStreamAssembly:
+    """Streamed function calls must survive assembly into a tool-use turn."""
+
+    @staticmethod
+    def _adapter():
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
+        return GeminiAdapter()
+
+    def test_function_call_finish_maps_to_tool_use(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"name": "search", "args": {"q": "x"}}}
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+        chunks = list(self._adapter().from_provider_chunks(raw))
+
+        assert [chunk.type for chunk in chunks] == [
+            ContentType.TOOL_USE,
+            ContentType.TEXT,
+        ]
+        assert chunks[1].finish_reason == FinishReason.TOOL_USE
+
+    def test_text_and_finish_in_one_chunk_are_both_emitted(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"text": "done"}]},
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+        chunks = list(self._adapter().from_provider_chunks(raw))
+
+        assert [chunk.type for chunk in chunks] == [
+            ContentType.TEXT,
+            ContentType.TEXT,
+        ]
+        assert chunks[0].delta == "done"
+        assert chunks[1].finish_reason == FinishReason.STOP
+
+    @pytest.mark.asyncio
+    async def test_collect_stream_keeps_function_arguments(self):
+        from sanityops_agent.llm.stream import collect_stream
+
+        adapter = self._adapter()
+
+        async def events():
+            for raw in (
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "search",
+                                            "args": {"q": "x"},
+                                        }
+                                    }
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ]
+                },
+            ):
+                for chunk in adapter.from_provider_chunks(raw):
+                    yield chunk
+
+        response = await collect_stream(events(), model="gemini-2.5-flash")
+
+        assert response.stop_reason == FinishReason.TOOL_USE
+        call = response.get_tool_calls()[0]
+        assert call.tool_name == "search"
+        assert call.tool_input == {"q": "x"}
+
+
+class TestGeminiAdapterToolArgumentValidation:
+    """Function-call arguments must be JSON objects."""
+
+    @staticmethod
+    def _adapter():
+        from sanityops_agent.llm.adapters.gemini_adapter import GeminiAdapter
+
+        return GeminiAdapter()
+
+    def test_non_object_arguments_raise(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "search", "args": [1, 2]}}],
+                    }
+                }
+            ]
+        }
+        with pytest.raises(LLMError, match="search"):
+            self._adapter().from_provider_response(raw)
+
+    def test_missing_arguments_default_to_empty_object(self):
+        raw = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "clock"}}],
+                    }
+                }
+            ]
+        }
+        response = self._adapter().from_provider_response(raw)
+
+        call = response.get_tool_calls()[0]
+        assert call.tool_name == "clock"
+        assert call.tool_input == {}

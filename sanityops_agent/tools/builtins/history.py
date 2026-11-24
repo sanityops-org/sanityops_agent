@@ -11,6 +11,7 @@ class HistoryTool(Tool):
     description = "Query tool execution history"
     parameters = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "query": {
                 "type": "string",
@@ -41,28 +42,14 @@ class HistoryTool(Tool):
         limit = kwargs.get("limit", 10)
         query = kwargs.get("query", "")
 
-        if not hasattr(store, "_store"):
+        if not callable(getattr(store, "search", None)):
             return ToolResult(
                 content="Error: history_store does not support querying",
                 success=False,
                 error="history_store does not support querying",
             )
 
-        entries = list(store._store.values())
-
-        # Filter by query if provided
-        if query:
-            entries = [
-                e for e in entries
-                if query.lower() in e.tool_name.lower()
-                or query.lower() in e.content.lower()
-            ]
-
-        # Sort by timestamp descending (most recent first)
-        entries.sort(key=lambda e: e.timestamp, reverse=True)
-
-        # Apply limit
-        entries = entries[:limit]
+        entries = await store.search(query, limit)
 
         if not entries:
             return ToolResult(content="No matching history entries found")

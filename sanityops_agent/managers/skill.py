@@ -61,7 +61,6 @@ class SkillManager:
                 frontmatter=frontmatter,
             )
 
-
     def _parse_frontmatter(self, content: str) -> dict | None:
         match = re.match(r"^---\s*\n(.+?)\n---\s*\n", content, re.DOTALL)
         if not match:
@@ -77,7 +76,11 @@ class SkillManager:
     def describe_available(self) -> list[dict]:
         """Return list of available skills with name and description"""
         return [
-           {"name": s.name, "description": s.description, "path": str(Path(s.dir).resolve())}
+            {
+                "name": s.name,
+                "description": s.description,
+                "path": str(Path(s.dir).resolve()),
+            }
             for s in self._skills.values()
         ]
 

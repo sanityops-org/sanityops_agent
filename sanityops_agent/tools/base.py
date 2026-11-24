@@ -11,6 +11,7 @@ from sanityops_agent.tools.context import ToolContext
 @dataclass
 class ToolResult:
     """Tool execution result"""
+
     content: str
     success: bool = True
     error: str | None = None
@@ -35,6 +36,7 @@ class Tool(ABC):
     description: str = ""
     parameters: dict = {}  # JSON Schema for tool parameters
     tags: list[str] = []  # Permission tags
+    _registered_context: ToolContext | None = None
 
     def __init__(self, context: ToolContext | None = None):
         self.context = context or ToolContext()
@@ -57,11 +59,14 @@ class Tool(ABC):
                 content=f"Error: {e}",
                 success=False,
                 error=str(e),
-                metadata={"execution_time": time.time() - start_time, "tool_name": self.name}
+                metadata={
+                    "execution_time": time.time() - start_time,
+                    "tool_name": self.name,
+                },
             )
 
     def to_tool_definition(self) -> ToolDefinition:
         """Convert to ToolDefinition format for LLM"""
-        return ToolDefinition(name=self.name,
-                              description=self.description,
-                              input_schema=self.parameters)
+        return ToolDefinition(
+            name=self.name, description=self.description, input_schema=self.parameters
+        )

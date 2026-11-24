@@ -9,6 +9,7 @@ from anthropic.types import Message as AnthropicMessage
 from sanityops_agent.core.message import (
     ContentType,
     Message,
+    RedactedThinkingBlock,
     Role,
     StreamChunk,
     TextBlock,
@@ -17,21 +18,16 @@ from sanityops_agent.core.message import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from sanityops_agent.llm.adapters.base import MessageAdapter
-from sanityops_agent.llm.base import LLMResponse
+from sanityops_agent.llm.adapters.base import MessageAdapter, map_sdk_error
+from sanityops_agent.llm.base import LLMResponse, normalize_usage
 from sanityops_agent.llm.exceptions import (
-    AuthenticationError,
-    ContextWindowExceededError,
     LLMError,
-    ProviderUnavailableError,
-    RateLimitError,
-    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _coalesce(result: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]) -> None:
+def _coalesce(result: list[dict], role: str, blocks: list[dict]) -> None:
     """Append an entry, merging it into the previous one when roles coincide.
 
     Anthropic requires roles to alternate: every tool_result for an assistant
@@ -132,8 +128,15 @@ class AnthropicAdapter(MessageAdapter):
                             {
                                 "type": "thinking",
                                 "thinking": block.thinking,
+                                **(
+                                    {"signature": block.signature}
+                                    if block.signature is not None
+                                    else {}
+                                ),
                             }
                         )
+                    elif isinstance(block, RedactedThinkingBlock):
+                        blocks.append({"type": "redacted_thinking", "data": block.data})
                     elif isinstance(block, ToolUseBlock):
                         blocks.append(
                             {
@@ -187,27 +190,33 @@ class AnthropicAdapter(MessageAdapter):
             if block_type == "text":
                 content.append(TextBlock(text=block.get("text", "")))
             elif block_type == "tool_use":
+                if not isinstance(block.get("input"), dict):
+                    raise LLMError(
+                        f"Expected object arguments for tool call {block.get('id', '')}"
+                    )
                 content.append(
                     ToolUseBlock(
                         tool_call_id=block.get("id", ""),
                         tool_name=block.get("name", ""),
-                        tool_input=block.get("input", {}),
+                        tool_input=block["input"],
                     )
                 )
             elif block_type == "thinking":
                 content.append(
                     ThinkingBlock(
                         thinking=block.get("thinking", ""),
+                        signature=block.get("signature"),
                     )
                 )
+            elif block_type == "redacted_thinking":
+                content.append(RedactedThinkingBlock(data=block["data"]))
 
         usage = raw.get("usage")
         return LLMResponse(
             content=content,
             stop_reason=stop_reason,
             model=raw.get("model", "unknown"),
-            provider="anthropic",
-            usage=dict(usage) if usage else {},
+            usage=normalize_usage(usage),
             raw_response=raw,
         )
 
@@ -215,7 +224,8 @@ class AnthropicAdapter(MessageAdapter):
         event_type = raw.get("type", "")
 
         if event_type == "message_start":
-            return None
+            usage = raw.get("message", {}).get("usage")
+            return StreamChunk(ContentType.TEXT, usage=usage) if usage else None
 
         if event_type == "content_block_start":
             block = raw.get("content_block", {})
@@ -225,15 +235,24 @@ class AnthropicAdapter(MessageAdapter):
             if block_type == "tool_use":
                 return StreamChunk(
                     type=ContentType.TOOL_USE,
-                    delta={"name": block.get("name", "")},
                     tool_call_id=block.get("id", ""),
+                    delta={"name": block.get("name"), "input": block.get("input", {})},
                     index=index,
                 )
             if block_type == "thinking":
                 return StreamChunk(
                     type=ContentType.THINKING,
-                    delta="",
+                    delta=block.get("thinking", ""),
+                    signature=block.get("signature"),
                     index=index,
+                )
+            if block_type == "redacted_thinking":
+                return StreamChunk(
+                    ContentType.REDACTED_THINKING, delta=block["data"], index=index
+                )
+            if block_type == "text":
+                return StreamChunk(
+                    ContentType.TEXT, delta=block.get("text", ""), index=index
                 )
             return None
 
@@ -254,11 +273,14 @@ class AnthropicAdapter(MessageAdapter):
                     delta=delta.get("thinking", ""),
                     index=index,
                 )
+            if delta_type == "signature_delta":
+                return StreamChunk(
+                    ContentType.THINKING, signature=delta["signature"], index=index
+                )
             if delta_type == "input_json_delta":
-                # Match the OpenAI chunk shape so one consumer handles both.
                 return StreamChunk(
                     type=ContentType.TOOL_USE,
-                    delta={"arguments": delta.get("partial_json", "")},
+                    delta=delta.get("partial_json", ""),
                     index=index,
                 )
             return None
@@ -266,174 +288,42 @@ class AnthropicAdapter(MessageAdapter):
         if event_type == "message_delta":
             delta = raw.get("delta", {})
             stop_reason = delta.get("stop_reason")
-            # usage arrives on this event alongside the stop reason.
-            usage = raw.get("usage")
-            if stop_reason or usage:
+            if stop_reason or raw.get("usage"):
                 return StreamChunk(
                     type=ContentType.TEXT,
-                    finish_reason=(
-                        self._map_stop_reason(stop_reason) if stop_reason else None
-                    ),
-                    usage=dict(usage) if usage else None,
+                    usage=raw.get("usage"),
+                    finish_reason=self._map_stop_reason(stop_reason)
+                    if stop_reason
+                    else None,
                 )
             return None
 
         return None
 
     @staticmethod
-    def map_exception(exception: Exception) -> Exception:
-        """Map provider-specific exceptions to internal LLMError types."""
-        exc_type_name = type(exception).__name__
-        msg = str(exception).lower()
-
-        if exc_type_name in ("AuthenticationError",):
-            err: LLMError = AuthenticationError(str(exception))
-            err.recoverable = False
-            return err
-        if exc_type_name in ("RateLimitError",):
-            err = RateLimitError(
-                str(exception),
-                retry_after=extract_retry_after(exception),
-            )
-            err.recoverable = True
-            return err
-        if exc_type_name in ("APIError", "APIConnectionError", "OverloadedError"):
-            return ProviderUnavailableError(str(exception))
-        if exc_type_name in ("BadRequestError",):
-            # Prefer a structural signal (HTTP 400) alongside message keywords,
-            # which providers change freely. Known Anthropic phrasings:
-            # "prompt is too long: ..." and "... context ... exceeds ..." .
-            status = getattr(getattr(exception, "response", None), "status_code", None)
-            if status is None or status == 400:
-                context_window = "too long" in msg or (
-                    "context" in msg and "exceed" in msg
-                )
-                if context_window:
-                    return ContextWindowExceededError(str(exception))
-        return LLMError(str(exception))
+    def map_exception(exception: Exception) -> LLMError:
+        return map_sdk_error(exception, "Anthropic")
 
     def from_sdk_response(self, response: AnthropicMessage) -> LLMResponse:
         """Convert Anthropic SDK Message to LLMResponse."""
-        content: list = []
-        for block in response.content:
-            if block.type == "text":
-                content.append(TextBlock(text=block.text))
-            elif block.type == "tool_use":
-                content.append(
-                    ToolUseBlock(
-                        tool_call_id=block.id or "",
-                        tool_name=block.name or "",
-                        tool_input=block.input or {},
-                    )
-                )
-            elif block.type == "thinking":
-                content.append(
-                    ThinkingBlock(
-                        thinking=block.thinking or "",
-                    )
-                )
-
-        usage = response.usage.model_dump() if response.usage else {}
-        return LLMResponse(
-            content=content,
-            stop_reason=self._map_stop_reason(response.stop_reason),
-            model=response.model or "unknown",
-            provider="anthropic",
-            usage=usage,
-            raw_response=response.model_dump(),
-        )
+        return self.from_provider_response(response.model_dump())
 
     def from_sdk_stream_event(
         self, event: ParsedMessageStreamEvent
     ) -> StreamChunk | None:
-        """Convert Anthropic SDK MessageStreamEvent to StreamChunk."""
-        event_type = event.type
-
-        # Only the raw events (content_block_start / content_block_delta /
-        # message_delta) are handled. messages.stream() additionally yields
-        # parsed convenience events (text / thinking / input_json) that carry
-        # the SAME payloads; handling both emitted every fragment twice, which
-        # doubled thinking text and corrupted accumulated tool arguments.
-
-        if event_type == "content_block_start":
-            block = getattr(event, "content_block", None)
-            if block is None:
-                return None
-            index = getattr(event, "index", 0)
-            if block.type == "tool_use":
-                # The tool name is only known here, and the index must match the
-                # one later content_block_delta events carry, or the consumer
-                # opens a second buffer and drops the name.
-                return StreamChunk(
-                    type=ContentType.TOOL_USE,
-                    delta={"name": getattr(block, "name", "") or ""},
-                    tool_call_id=getattr(block, "id", ""),
-                    index=index,
-                )
-            if block.type == "thinking":
-                # Block-start marker: the empty delta carries no content, it
-                # only opens the buffer at this index so the thinking_delta
-                # events that follow land in the right one.
-                return StreamChunk(
-                    type=ContentType.THINKING,
-                    delta="",
-                    index=index,
-                )
+        # Parsed convenience events duplicate the raw content deltas.
+        if event.type not in (
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "message_delta",
+        ):
             return None
-
-        if event_type == "content_block_delta":
-            block_delta = getattr(event, "delta", None)
-            if block_delta is None:
-                return None
-            delta_type = getattr(block_delta, "type", "")
-            index = getattr(event, "index", 0)
-
-            if delta_type == "text_delta":
-                return StreamChunk(
-                    type=ContentType.TEXT,
-                    delta=getattr(block_delta, "text", ""),
-                    index=index,
-                )
-            if delta_type == "thinking_delta":
-                return StreamChunk(
-                    type=ContentType.THINKING,
-                    delta=getattr(block_delta, "thinking", ""),
-                    index=index,
-                )
-            if delta_type == "input_json_delta":
-                # Match the OpenAI chunk shape so one consumer handles both.
-                return StreamChunk(
-                    type=ContentType.TOOL_USE,
-                    delta={"arguments": getattr(block_delta, "partial_json", "")},
-                    index=index,
-                )
-            return None
-
-        if event_type == "message_delta":
-            stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
-            # usage arrives on this event alongside the stop reason.
-            usage = getattr(event, "usage", None)
-            usage_dict: dict | None = None
-            if usage is not None:
-                try:
-                    usage_dict = dict(usage)
-                except (TypeError, ValueError):
-                    # Never expected from the SDK; surface it instead of
-                    # silently losing the usage report.
-                    logger.warning(
-                        "Could not convert message_delta usage %r to dict",
-                        usage,
-                    )
-                    usage_dict = None
-            if stop_reason or usage_dict:
-                return StreamChunk(
-                    type=ContentType.TEXT,
-                    finish_reason=(
-                        self._map_stop_reason(stop_reason) if stop_reason else None
-                    ),
-                    usage=usage_dict,
-                )
-            return None
-
-        # content_block_stop, message_start, etc. — no content to yield
-        return None
+        chunk = self.from_provider_chunk(event.model_dump(exclude_unset=True))
+        if (
+            chunk
+            and chunk.type == ContentType.TOOL_USE
+            and isinstance(chunk.delta, str)
+        ):
+            chunk.delta = {"arguments": chunk.delta}
+        return chunk

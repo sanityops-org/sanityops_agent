@@ -1,4 +1,5 @@
 """Unit tests for sanityops_agent.tools.builtins.skill - SkillTool"""
+
 from __future__ import annotations
 
 import pytest

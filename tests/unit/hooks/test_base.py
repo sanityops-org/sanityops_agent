@@ -1,4 +1,5 @@
 """Unit tests for agent/hooks/base.py"""
+
 from __future__ import annotations
 
 import pytest
@@ -13,6 +14,7 @@ from sanityops_agent.hooks.base import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class NoOpHook(Hook):
     """Concrete hook that does nothing (for testing)."""
@@ -53,6 +55,7 @@ class ModifyingHook(Hook):
 # HookEvent tests
 # ---------------------------------------------------------------------------
 
+
 class TestHookEvent:
     def test_enum_values(self):
         """All expected HookEvent values exist and have correct string values."""
@@ -73,6 +76,7 @@ class TestHookEvent:
 # ---------------------------------------------------------------------------
 # HookContext tests
 # ---------------------------------------------------------------------------
+
 
 class TestHookContext:
     def test_creation_defaults(self):
@@ -112,6 +116,7 @@ class TestHookContext:
 # Hook abstract class tests
 # ---------------------------------------------------------------------------
 
+
 class TestHook:
     def test_hook_is_abstract(self):
         """Hook cannot be instantiated directly."""
@@ -136,6 +141,7 @@ class TestHook:
 # ---------------------------------------------------------------------------
 # HookExecutor tests
 # ---------------------------------------------------------------------------
+
 
 class TestHookExecutor:
     def setup_method(self):

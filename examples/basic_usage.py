@@ -17,6 +17,7 @@ import os
 # Example 1: Quick Start with OpenAI Provider
 # ---------------------------------------------------------------------------
 
+
 async def example_quick_start():
     """Minimal example: create a parent agent and run a task."""
     from sanityops_agent.agents.factory import AgentFactory
@@ -51,6 +52,7 @@ async def example_quick_start():
 # ---------------------------------------------------------------------------
 # Example 2: Custom Tool
 # ---------------------------------------------------------------------------
+
 
 async def example_custom_tool():
     """Register a custom tool and use it in the agent loop."""
@@ -121,8 +123,9 @@ async def example_custom_tool():
 # Example 3: Multi-Agent (Parent + Sub-Agent)
 # ---------------------------------------------------------------------------
 
+
 async def example_multi_agent():
-    """Parent agent delegates work to a sub-sanityops_agent."""
+    """Parent agent delegates work to a sub-agent."""
     from sanityops_agent.agents.factory import AgentFactory
     from sanityops_agent.llm.providers.openai import OpenAIProvider
     from sanityops_agent.tools.registry import ToolRegistry
@@ -165,6 +168,7 @@ async def example_multi_agent():
 # Example 4: Hooks (Intercept Tool Calls)
 # ---------------------------------------------------------------------------
 
+
 async def example_hooks():
     """Use hooks to intercept and approve/deny tool calls."""
     from sanityops_agent.agents.factory import AgentFactory
@@ -177,9 +181,7 @@ async def example_hooks():
 
         DANGEROUS_TOOLS = {"bash", "file_write"}
 
-        async def execute(
-            self, event: HookEvent, context: dict
-        ) -> HookContext:
+        async def execute(self, event: HookEvent, context: dict) -> HookContext:
             if event == HookEvent.BEFORE_TOOL_EXEC:
                 tool_name = context.get("tool_name", "")
                 if tool_name in self.DANGEROUS_TOOLS:
@@ -211,6 +213,7 @@ async def example_hooks():
 # ---------------------------------------------------------------------------
 # Example 5: State Persistence
 # ---------------------------------------------------------------------------
+
 
 async def example_state_persistence():
     """Save and resume agent conversation state."""
@@ -256,6 +259,7 @@ async def example_state_persistence():
 # Example 6: Streaming Responses
 # ---------------------------------------------------------------------------
 
+
 async def example_streaming():
     """Stream tokens from the LLM as they are generated."""
     from sanityops_agent.agents.factory import AgentFactory
@@ -288,6 +292,7 @@ async def example_streaming():
 # ---------------------------------------------------------------------------
 # Run all examples
 # ---------------------------------------------------------------------------
+
 
 async def main():
     examples = {

@@ -55,6 +55,7 @@ from sanityops_agent.llm.providers.openai import OpenAIProvider
 from sanityops_agent.agents.factory import AgentFactory
 from sanityops_agent.tools.registry import ToolRegistry
 
+
 async def main():
     provider = OpenAIProvider(
         api_key="your-key",  # or set OPENAI_API_KEY env var
@@ -75,6 +76,7 @@ async def main():
 
     await provider.close()
 
+
 asyncio.run(main())
 ```
 
@@ -82,6 +84,7 @@ asyncio.run(main())
 
 ```python
 from sanityops_agent.tools.base import Tool, ToolResult
+
 
 class WeatherTool(Tool):
     name = "get_weather"
@@ -97,6 +100,7 @@ class WeatherTool(Tool):
     async def execute(self, city: str, **kwargs) -> ToolResult:
         # Call weather API here
         return ToolResult(content=f"Sunny, 25°C in {city}")
+
 
 # Register it
 registry = ToolRegistry()
@@ -171,16 +175,85 @@ Supported environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROVIDER` | `openai` | Provider name: `openai` or `anthropic` |
+| `LLM_PROVIDER` | `openai` | Provider name: `openai`, `anthropic`, or `gemini` |
 | `API_KEY` | *(required)* | Your API key |
 | `BASE_URL` | *(empty)* | Custom endpoint (vLLM, Azure, etc.) |
 | `MODEL` | `gpt-4o-mini` | Model name |
 | `EXTRA_BODY` | *(empty)* | JSON object forwarded to the provider SDK request (Anthropic/OpenAI) |
 | `MAX_LOOPS` | `30` | Max agent loops per run |
-| `MAX_TOKENS` | *(provider default)* | Max tokens per LLM call; unset uses the provider default (Anthropic: 32768) |
+| `MAX_TOKENS` | unset | Max output tokens per request; the example file leaves it unset. Anthropic requires an explicit positive limit. |
 | `TOTAL_TIMEOUT` | `300` | Total timeout in seconds |
 | `TEMPERATURE` | `0.7` | Sampling temperature |
 | `SYSTEM_PROMPT` | *(see .env)* | System prompt for the agent |
+
+### Runtime configuration and limits
+
+`AgentFactory` accepts the environment-backed `sanityops_agent.AgentConfig`
+or the explicit `RuntimeAgentConfig`. The latter is also available from
+`sanityops_agent.core.agent` as `AgentConfig`.
+
+Anthropic accepts `max_tokens` on the request, in the effective `extra_body`,
+or as an explicit provider constructor argument, in that order. The streaming
+example passes its configured limit to the parent and delegated agents.
+
+Each `run()` has its own deadline, result and token budget. Delegated work
+uses the parent's remaining time and shares its budget. If a provider reports
+incomplete usage, `AgentResult.usage_complete` is false. For strict budgeting,
+set `strict_token_budget=True` and supply a provider with an async
+`count_input_tokens(messages, tools)` method that counts the intended
+request. The agent stops before requests it cannot budget.
+
+### Tool permissions and parameters
+
+The agent uses the same tool selection when it builds a model request and
+executes its response. Hosts can set `RuntimeAgentConfig.allowed_tool_names`
+or `ToolContext.set("allowed_tools", names)` to a set of registered names.
+An explicit empty set disables tools. The existing tag filter remains
+available. A delegated task can only narrow the parent's tool access.
+
+OpenAI tools use regular Schema validation by default. To explicitly request
+OpenAI strict mode, set `definition.provider_config["strict"] = True` on the
+`ToolDefinition` returned by the tool. Strict schemas must satisfy OpenAI's
+object requirements. The agent validates arguments against the registered
+Schema before executing the tool in either mode.
+
+The streaming example registers calculation, time, history, local to-dos
+and delegation. To add built-in file tools, supply a host-selected POSIX
+workspace with `ToolContext.set("workdir", absolute_path)`. Write and patch
+also require `allow_file_writes=True` in that context. A model-requested Bash
+call requires a host-provided isolated `shell_runner` in the same context.
+The runner is an async callable accepting the keyword arguments `command`,
+`timeout` and `max_output_bytes` and returning a `ToolResult`. The host
+controls mounts, inherited environment, network access and process cleanup.
+
+The file tools rely on POSIX descriptor-relative access (`os.name == "posix"`)
+and are not available on Windows; they raise `OSError` there.
+
+### Managed services
+
+Use one factory, tool registry, tool context and set of stateful managers per
+authenticated session. Reuse those objects for sequential turns in that
+session. For persistent state, pass the session identifier and trusted
+system prompt to `StateManager` and keep the file in an application-owned
+private directory.
+
+`AppConfig.load(managed=True)` reads from the process environment or an
+explicit absolute `env_file`. Pass `allowed_base_urls` to
+`ProviderFactory.create` to restrict the provider to approved HTTPS
+destinations and disable redirects and environment proxies.
+
+### Upgrading from 0.1.2
+
+- Anthropic requires a positive `max_tokens`. Pass it to the provider
+  constructor or to each call; there is no default.
+- `ThinkingBlock.thinking_signature` is now `ThinkingBlock.signature`. The old
+  attribute still reads the value, but new code should use `signature`.
+- The `ProviderConfig.LLM_PROVIDER` attribute is gone. The `LLM_PROVIDER`
+  environment variable still sets `PROVIDER`.
+- `AgentConfig.total_timeout` is a float; integer values keep working.
+- File tools need `ToolContext.set("workdir", ...)` (and
+  `allow_file_writes=True` for writes); Bash calls need a `shell_runner`.
+  Both are POSIX-only.
 
 ## Running Examples
 

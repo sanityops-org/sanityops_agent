@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,14 @@ from sanityops_agent.core.message import (
     ContentType,
     ErrorBlock,
     Message,
+    RedactedThinkingBlock,
     Role,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
+from sanityops_agent.managers._files import write_private_json
 
 logger = logging.getLogger(__name__)
 
@@ -34,49 +37,68 @@ class StateManager:
     previous state file intact rather than corrupting it.
     """
 
-    def __init__(self, state_path: str = "agent_state.json"):
+    STATE_VERSION = 1
+
+    def __init__(
+        self,
+        state_path: str | Path = "agent_state.json",
+        *,
+        session_id: str | None = None,
+        system_prompt: str = "",
+    ):
         self.state_path = Path(state_path)
+        self.session_id = session_id
+        self.system_prompt = system_prompt
 
     async def save(self, context: AgentContext) -> None:
         """Save context to JSON"""
         data = {
+            "version": self.STATE_VERSION,
+            "session_id": self.session_id,
             "messages": self._serialize_messages(context.messages),
             "total_tokens": context.total_tokens,
             "has_compacted": context.has_compacted,
             "last_summary": context.last_summary,
         }
-        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        payload = json.dumps(data, indent=2)
-        # Create the parent eagerly: os.open would otherwise fail when the
-        # caller passed a path under a directory that does not exist yet.
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        # Create the temp file owner-only from the start: write_text() would
-        # briefly create it with umask permissions, exposing conversation
-        # content to other users before a later chmod could run.
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, payload.encode("utf-8"))
-        finally:
-            os.close(fd)
-        try:
-            os.replace(tmp_path, self.state_path)
-        except OSError:
-            # Cleanup is best-effort: a failing unlink must not mask the
-            # replace error, and a stale .tmp file is harmless (the next
-            # save overwrites it).
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        self._check_directory()
+        write_private_json(self.state_path, data)
+
+    def _check_directory(self) -> None:
+        if self.session_id is None or os.name != "posix":
+            return
+        parent = self.state_path.parent.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or parent.st_mode & 0o077
+        ):
+            raise PermissionError(
+                "Managed session state requires an owner-only directory"
+            )
 
     async def load(self) -> AgentContext:
         """Load context from JSON"""
-        if not self.state_path.exists():
-            raise FileNotFoundError(f"State file not found: {self.state_path}")
-
+        self._check_directory()
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
-            data = json.loads(self.state_path.read_text())
+            fd = os.open(self.state_path, flags)
+            with os.fdopen(fd, encoding="utf-8") as source:
+                attributes = os.fstat(source.fileno())
+                if not stat.S_ISREG(attributes.st_mode):
+                    raise ValueError("State must be a regular file")
+                if (
+                    self.session_id is not None
+                    and os.name == "posix"
+                    and (
+                        attributes.st_uid != os.geteuid() or attributes.st_mode & 0o077
+                    )
+                ):
+                    raise PermissionError("Managed session state must be owner-only")
+                data = json.load(source)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"State file not found: {self.state_path}") from exc
         except json.JSONDecodeError as e:
             raise ValueError(
                 f"State file {self.state_path} is corrupt or not valid JSON: {e}"
@@ -86,6 +108,10 @@ class StateManager:
                 f"State file {self.state_path} has an unexpected structure: "
                 "expected a JSON object with a 'messages' list"
             )
+        if data.get("version", 0) not in (0, self.STATE_VERSION):
+            raise ValueError("Unsupported conversation state version")
+        if data.get("session_id") != self.session_id:
+            raise PermissionError("Conversation state belongs to a different session")
         messages_data = data.get("messages", [])
         if not isinstance(messages_data, list):
             raise ValueError(
@@ -93,6 +119,8 @@ class StateManager:
             )
         messages = []
         for msg_data in messages_data:
+            if not isinstance(msg_data, dict):
+                raise ValueError("Each saved message must be an object")
             try:
                 role = Role(msg_data["role"])
             except (KeyError, ValueError) as e:
@@ -116,12 +144,48 @@ class StateManager:
                 )
             )
 
-        return AgentContext(
+        context = AgentContext(
             messages=messages,
             total_tokens=data.get("total_tokens", 0),
             has_compacted=data.get("has_compacted", False),
             last_summary=data.get("last_summary", ""),
         )
+        if self.session_id is not None:
+            previous = [
+                block.text
+                for msg in messages
+                if msg.role is Role.SYSTEM
+                for block in msg.content
+                if isinstance(block, TextBlock)
+            ]
+            if (
+                context.has_signed_turn(0)
+                and "\n\n".join(previous) != self.system_prompt
+            ):
+                raise ValueError(
+                    "Signed history requires the original trusted system prompt"
+                )
+            context.messages = [msg for msg in messages if msg.role is not Role.SYSTEM]
+            if self.system_prompt:
+                context.messages.insert(
+                    0, Message.from_text(Role.SYSTEM, self.system_prompt)
+                )
+        assistant = next(
+            (msg for msg in reversed(messages) if msg.role is Role.ASSISTANT), None
+        )
+        # Anthropic rejects an unsigned thinking/tool turn on resume. Other
+        # providers (e.g. Gemini) can replay the turn without a signature.
+        if assistant and assistant.provider in (None, "anthropic"):
+            if any(
+                isinstance(block, ToolUseBlock) for block in assistant.content
+            ) and any(
+                isinstance(block, ThinkingBlock) and not block.signature
+                for block in assistant.content
+            ):
+                raise ValueError(
+                    "Cannot resume an unsigned thinking/tool turn; start a new turn from a completed checkpoint"
+                )
+        return context
 
     def _serialize_messages(self, messages) -> list[dict]:
         result = []
@@ -146,53 +210,39 @@ class StateManager:
 
         Falls back to dataclass fields for any block type added later, so a
         new block class never silently degrades to text on save.
-
-        Gemini thoughtSignature fields (text_signature, thinking_signature,
-        thought_signature) are carried through so signature replay still works
-        after a restore.
         """
         if isinstance(block, TextBlock):
-            return {
-                "type": block.type.value,
-                "text": block.text,
-                **(
-                    {"text_signature": block.text_signature}
-                    if block.text_signature is not None
-                    else {}
-                ),
-            }
+            data = {"type": block.type.value, "text": block.text}
+            if block.text_signature is not None:
+                data["text_signature"] = block.text_signature
+            return data
         if isinstance(block, ThinkingBlock):
-            return {
-                "type": block.type.value,
-                "thinking": block.thinking,
-                **(
-                    {"thinking_signature": block.thinking_signature}
-                    if block.thinking_signature is not None
-                    else {}
-                ),
-            }
+            data = {"type": block.type.value, "thinking": block.thinking}
+            if block.signature is not None:
+                data["signature"] = block.signature
+            return data
+        if isinstance(block, RedactedThinkingBlock):
+            return {"type": block.type.value, "data": block.data}
         if isinstance(block, ToolResultBlock):
-            data: dict[str, Any] = {
+            result_data: dict[str, Any] = {
                 "type": block.type.value,
                 "tool_call_id": block.tool_call_id,
                 "tool_result_content": block.tool_result_content,
                 "is_error": block.is_error,
             }
             if block.history_key is not None:
-                data["history_key"] = block.history_key
-            return data
+                result_data["history_key"] = block.history_key
+            return result_data
         if isinstance(block, ToolUseBlock):
-            return {
+            data = {
                 "type": block.type.value,
                 "tool_call_id": block.tool_call_id,
                 "tool_name": block.tool_name,
                 "tool_input": block.tool_input,
-                **(
-                    {"thought_signature": block.thought_signature}
-                    if block.thought_signature is not None
-                    else {}
-                ),
             }
+            if block.thought_signature is not None:
+                data["thought_signature"] = block.thought_signature
+            return data
         if isinstance(block, ErrorBlock):
             return {
                 "type": block.type.value,
@@ -220,19 +270,6 @@ class StateManager:
             blocks: list[ContentBlockUnion] = []
             for b in raw_blocks:
                 block_type = b.get("type", ContentType.TEXT.value)
-                if block_type in (
-                    ContentType.TOOL_USE.value,
-                    ContentType.TOOL_RESULT.value,
-                ) and not b.get("tool_call_id"):
-                    # tool_call_id is the required linking key for both tool
-                    # block types; `not` rejects both None and "" (an empty
-                    # id would leave the block unpaired). Raise the ValueError
-                    # the load path documents instead of a bare KeyError (or a
-                    # silently unpaired block that would break tool pairing).
-                    raise ValueError(
-                        f"Tool block of type {block_type!r} is missing a "
-                        f"'tool_call_id'; the state file is corrupt"
-                    )
                 if block_type == ContentType.TOOL_USE.value:
                     blocks.append(
                         ToolUseBlock(
@@ -255,9 +292,13 @@ class StateManager:
                     blocks.append(
                         ThinkingBlock(
                             thinking=b.get("thinking", ""),
-                            thinking_signature=b.get("thinking_signature"),
+                            # Older state files store the signature under the
+                            # pre-rename key.
+                            signature=b.get("signature") or b.get("thinking_signature"),
                         )
                     )
+                elif block_type == ContentType.REDACTED_THINKING.value:
+                    blocks.append(RedactedThinkingBlock(data=b["data"]))
                 elif block_type == ContentType.ERROR.value:
                     blocks.append(
                         ErrorBlock(

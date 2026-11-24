@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Iterator
 from typing import Any
 
 from sanityops_agent.core.message import (
@@ -17,18 +18,31 @@ from sanityops_agent.core.message import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from sanityops_agent.llm.adapters.base import MessageAdapter
-from sanityops_agent.llm.base import LLMResponse
+from sanityops_agent.llm.adapters.base import MessageAdapter, _extract_retry_after
+from sanityops_agent.llm.base import LLMResponse, normalize_usage
 from sanityops_agent.llm.exceptions import (
     AuthenticationError,
     ContextWindowExceededError,
     LLMError,
     ProviderUnavailableError,
     RateLimitError,
-    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_usage(usage: dict) -> dict:
+    """Map Gemini's camelCase counters onto the shared usage keys."""
+    result = dict(usage)
+    if "promptTokenCount" in result:
+        result.setdefault("input_tokens", result["promptTokenCount"])
+    if "candidatesTokenCount" in result:
+        result.setdefault("output_tokens", result["candidatesTokenCount"])
+    if "thoughtsTokenCount" in result:
+        result["output_tokens"] = (
+            result.get("output_tokens", 0) + result["thoughtsTokenCount"]
+        )
+    return normalize_usage(result)
 
 
 class GeminiAdapter(MessageAdapter):
@@ -139,22 +153,26 @@ class GeminiAdapter(MessageAdapter):
                 if isinstance(block, TextBlock):
                     # Handle text with optional thoughtSignature
                     if is_same_model and block.text_signature:
-                        parts.append({
-                            "text": block.text,
-                            "thoughtSignature": block.text_signature,
-                        })
+                        parts.append(
+                            {
+                                "text": block.text,
+                                "thoughtSignature": block.text_signature,
+                            }
+                        )
                     else:
                         parts.append({"text": block.text})
 
                 elif isinstance(block, ThinkingBlock):
                     # Handle thinking with optional thoughtSignature
                     # Cross-model: convert to plain text, drop signature
-                    if is_same_model and block.thinking_signature:
-                        parts.append({
-                            "thought": True,
-                            "text": block.thinking,
-                            "thoughtSignature": block.thinking_signature,
-                        })
+                    if is_same_model and block.signature:
+                        parts.append(
+                            {
+                                "thought": True,
+                                "text": block.thinking,
+                                "thoughtSignature": block.signature,
+                            }
+                        )
                     elif is_same_model:
                         parts.append({"thought": True, "text": block.thinking})
                     else:
@@ -271,86 +289,113 @@ class GeminiAdapter(MessageAdapter):
             # must be checked BEFORE the text branch.
             if part.get("thought") is True:
                 if self.store_thinking and part.get("text"):
-                    content.append(ThinkingBlock(
-                        thinking=part["text"],
-                        thinking_signature=part.get("thoughtSignature"),
-                    ))
+                    content.append(
+                        ThinkingBlock(
+                            thinking=part["text"],
+                            signature=part.get("thoughtSignature"),
+                        )
+                    )
                 continue
             if "text" in part and part.get("text") is not None:
-                content.append(TextBlock(
-                    text=part["text"],
-                    text_signature=part.get("thoughtSignature"),
-                ))
+                content.append(
+                    TextBlock(
+                        text=part["text"],
+                        text_signature=part.get("thoughtSignature"),
+                    )
+                )
             elif "functionCall" in part:
                 fc = part["functionCall"]
+                arguments = fc.get("args")
+                if arguments is None:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    raise LLMError(
+                        "Expected object arguments for tool call "
+                        f"{fc.get('id') or fc.get('name', '')}"
+                    )
                 content.append(
                     ToolUseBlock(
                         tool_call_id=fc.get("id") or fc.get("name", ""),
                         tool_name=fc.get("name", ""),
-                        tool_input=fc.get("args") or {},
+                        tool_input=arguments,
                         thought_signature=part.get("thoughtSignature"),
                     )
                 )
 
         usage = raw.get("usageMetadata", {})
+        # Gemini reports STOP even when the response ends in function calls;
+        # report the provider-neutral tool-use finish reason instead.
+        if finish_reason in (FinishReason.STOP, FinishReason.END_TURN) and any(
+            isinstance(block, ToolUseBlock) for block in content
+        ):
+            finish_reason = FinishReason.TOOL_USE
         return LLMResponse(
             content=content,
             stop_reason=finish_reason,
             model=raw.get("modelVersion", "unknown"),
             provider="google",
-            usage=usage,
+            usage=_normalize_usage(usage),
             raw_response=raw,
         )
 
     def from_provider_chunk(self, raw: dict) -> StreamChunk | None:
-        """Convert a Gemini streaming chunk dict to StreamChunk.
+        """Convert a Gemini streaming chunk dict to its first StreamChunk."""
+        return next(self.from_provider_chunks(raw), None)
+
+    def from_provider_chunks(self, raw: dict) -> Iterator[StreamChunk]:
+        """Yield every semantic part of a Gemini streaming chunk.
 
         The caller passes ``chunk.model_dump(by_alias=True, exclude_none=True)``.
+        A chunk can carry several parts, a finish reason, and usage together, so
+        each piece is yielded separately.
         """
-        candidates = raw.get("candidates", [])
+        candidates = raw.get("candidates") or []
+        usage = raw.get("usageMetadata") or {}
         if not candidates:
-            return None
+            if usage:
+                yield StreamChunk(ContentType.TEXT, usage=_normalize_usage(usage))
+            return
 
         candidate = candidates[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        finish_reason = self._map_stop_reason(candidate.get("finishReason"))
+        parts = candidate.get("content", {}).get("parts") or []
+        has_tool_call = False
 
-        if not parts:
-            if finish_reason != FinishReason.END_TURN:
-                return StreamChunk(
-                    type=ContentType.TEXT,
-                    delta=None,
-                    finish_reason=finish_reason,
+        for part in parts:
+            signature = part.get("thoughtSignature")
+            # Thought parts also carry `text` — check the flag first.
+            if part.get("thought") is True:
+                yield StreamChunk(
+                    ContentType.THINKING,
+                    delta=part.get("text") or "",
+                    signature=signature,
                 )
-            return None
+            elif part.get("text") is not None:
+                yield StreamChunk(
+                    ContentType.TEXT, delta=part["text"], signature=signature
+                )
+            elif "functionCall" in part:
+                fc = part["functionCall"]
+                has_tool_call = True
+                yield StreamChunk(
+                    ContentType.TOOL_USE,
+                    delta={"name": fc.get("name"), "args": fc.get("args") or {}},
+                    tool_call_id=fc.get("id") or fc.get("name"),
+                    signature=signature,
+                )
 
-        part = parts[0]
+        if candidate.get("finishReason") is not None:
+            finish_reason = self._map_stop_reason(candidate["finishReason"])
+            if finish_reason in (FinishReason.STOP, FinishReason.END_TURN) and (
+                has_tool_call
+            ):
+                finish_reason = FinishReason.TOOL_USE
+            yield StreamChunk(ContentType.TEXT, finish_reason=finish_reason)
 
-        # Thought parts also carry `text` — check the flag first.
-        if part.get("thought") is True:
-            return StreamChunk(
-                type=ContentType.THINKING,
-                delta=part.get("text") or "",
-            )
-
-        if "text" in part and part.get("text") is not None:
-            return StreamChunk(
-                type=ContentType.TEXT,
-                delta=part["text"],
-            )
-
-        if "functionCall" in part:
-            fc = part["functionCall"]
-            return StreamChunk(
-                type=ContentType.TOOL_USE,
-                delta={"name": fc.get("name"), "args": fc.get("args") or {}},
-                tool_call_id=fc.get("id") or fc.get("name"),
-            )
-
-        return None
+        if usage:
+            yield StreamChunk(ContentType.TEXT, usage=_normalize_usage(usage))
 
     @staticmethod
-    def map_exception(exception: Exception) -> Exception:
+    def map_exception(exception: Exception) -> LLMError:
         """Map google-genai SDK exceptions to internal LLMError types.
 
         google-genai raises ``errors.APIError`` (and its subclasses
@@ -370,7 +415,7 @@ class GeminiAdapter(MessageAdapter):
             if code == 429:
                 err = RateLimitError(
                     str(exception),
-                    retry_after=extract_retry_after(exception),
+                    retry_after=_extract_retry_after(exception),
                 )
                 err.recoverable = True
                 return err
@@ -391,7 +436,7 @@ class GeminiAdapter(MessageAdapter):
         if exc_type_name in ("ResourceExhausted", "RateLimitError"):
             err = RateLimitError(
                 str(exception),
-                retry_after=extract_retry_after(exception),
+                retry_after=_extract_retry_after(exception),
             )
             err.recoverable = True
             return err
